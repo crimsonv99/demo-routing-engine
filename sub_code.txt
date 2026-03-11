@@ -1,0 +1,775 @@
+from __future__ import annotations
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import RedirectResponse, HTMLResponse
+from pydantic import BaseModel
+import geopandas as gpd
+from shapely.geometry import mapping, Point
+from shapely.strtree import STRtree
+import numpy as np
+import math
+import networkx as nx
+
+from preprocess import node_roads_preserve_attrs
+from routing_engine import RouteEngine
+from poi_loader import load_pois_csv
+
+import os
+import traceback
+
+print(f"[route_tool] Loaded app.py from: {__file__}")
+print(f"[route_tool] CWD: {os.getcwd()}")
+
+ROADS_PATH = "data/test_road.geojson"
+POIS_PATH = "data/VN Sample Data.csv"
+
+app = FastAPI(title="Top-3 Routing Tool (Road GeoJSON + POI CSV)")
+
+
+def _json_safe(v):
+    """Convert values to JSON-safe types (replace NaN/Inf with None)."""
+    if v is None:
+        return None
+    if hasattr(v, "item") and callable(getattr(v, "item")):
+        try:
+            v = v.item()
+        except Exception:
+            pass
+    if isinstance(v, (float, np.floating)):
+        if math.isnan(float(v)) or math.isinf(float(v)):
+            return None
+        return float(v)
+    return v
+
+
+@app.get("/")
+def root():
+    return RedirectResponse(url="/docs")
+
+
+@app.get("/map", response_class=HTMLResponse)
+def map_ui():
+    return HTMLResponse(
+        """<!doctype html>
+<html>
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
+  <title>Route Tool Map</title>
+  <link rel=\"stylesheet\" href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\" />
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #wrap { display: flex; height: 100%; }
+    #map { flex: 2; }
+    #panel {
+      flex: 1;
+      padding: 12px;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      overflow: auto;
+      border-left: 1px solid #ddd;
+      background: #fafafa;
+    }
+    .hint { color: #666; font-size: 13px; margin-bottom: 10px; }
+    .section { margin-bottom: 16px; }
+    .row { margin-bottom: 8px; }
+    .label { font-size: 12px; color: #555; margin-bottom: 4px; }
+    .value { font-weight: 600; word-break: break-word; }
+    button {
+      padding: 8px 10px;
+      border: 1px solid #ccc;
+      background: white;
+      cursor: pointer;
+      border-radius: 6px;
+      margin-right: 8px;
+      margin-bottom: 8px;
+    }
+    button.active { border-color: #333; font-weight: 700; }
+    pre {
+      white-space: pre-wrap;
+      background: white;
+      border: 1px solid #ddd;
+      padding: 8px;
+      border-radius: 6px;
+      font-size: 12px;
+    }
+    .route-card {
+      background: white;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 10px;
+      margin-bottom: 10px;
+    }
+    .route-title { font-weight: 700; margin-bottom: 6px; }
+  </style>
+</head>
+<body>
+<div id=\"wrap\">
+  <div id=\"map\"></div>
+  <div id=\"panel\">
+    <div class=\"section\">
+      <div class=\"hint\">Click map to set Start and End, then visualize route_top3.</div>
+      <button id=\"mode-start\" class=\"active\">Set Start</button>
+      <button id=\"mode-end\">Set End</button>
+      <button id=\"btn-route\">Route Top 3</button>
+      <button id=\"btn-clear\">Clear</button>
+    </div>
+
+    <div class=\"section\">
+      <div class=\"row\"><div class=\"label\">Start</div><div id=\"start-out\" class=\"value\">Not set</div></div>
+      <div class=\"row\"><div class=\"label\">End</div><div id=\"end-out\" class=\"value\">Not set</div></div>
+      <div class=\"row\"><div class=\"label\">Routing used</div><div id=\"used-out\" class=\"value\">-</div></div>
+      <div class=\"row\"><div class=\"label\">Road boundary</div><div id=\"boundary-out\" class=\"value\">Loading...</div></div>
+    </div>
+
+    <div class=\"section\">
+      <div class=\"row\"><label><input type=\"checkbox\" id=\"snap-to-poi\" checked> snap_to_poi</label></div>
+      <div class=\"row\"><label><input type=\"checkbox\" id=\"fallback-to-raw\" checked> fallback_to_raw</label></div>
+      <div class=\"row\"><div class=\"label\">Mode</div>
+        <select id=\"mode-select\">
+          <option value=\"car\">car</option>
+          <option value=\"motorcycle\">motorcycle</option>
+        </select>
+      </div>
+      <div class=\"row\"><div class=\"label\">k</div><input id=\"k-input\" type=\"number\" value=\"3\" min=\"1\" max=\"3\" /></div>
+      <div class=\"row\"><div class=\"label\">poi_candidates</div><input id=\"poi-candidates\" type=\"number\" value=\"3\" min=\"1\" max=\"10\" /></div>
+    </div>
+
+    <div class=\"section\">
+      <div class=\"label\">Nearest POI at clicked point</div>
+      <pre id=\"poi-out\">No point selected.</pre>
+    </div>
+
+    <div class=\"section\">
+      <div class=\"label\">Routes</div>
+      <div id=\"routes-out\">No routes yet.</div>
+    </div>
+  </div>
+</div>
+
+<script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"></script>
+<script>
+  const map = L.map('map').setView([10.78, 106.65], 14);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+
+  let clickMode = 'start';
+  let startPoint = null;
+  let endPoint = null;
+  let startMarker = null;
+  let endMarker = null;
+  let routeLayers = [];
+  let boundaryLayer = null;
+  let boundaryBounds = null;
+
+  const startOut = document.getElementById('start-out');
+  const endOut = document.getElementById('end-out');
+  const usedOut = document.getElementById('used-out');
+  const boundaryOut = document.getElementById('boundary-out');
+  const poiOut = document.getElementById('poi-out');
+  const routesOut = document.getElementById('routes-out');
+  const modeStartBtn = document.getElementById('mode-start');
+  const modeEndBtn = document.getElementById('mode-end');
+  async function loadBoundary() {
+    try {
+      const res = await fetch('/roads_bounds');
+      if (!res.ok) {
+        boundaryOut.textContent = 'Failed to load';
+        return;
+      }
+      const b = await res.json();
+      boundaryBounds = b;
+      boundaryOut.textContent = `${b.min_lat.toFixed(6)}, ${b.min_lon.toFixed(6)} → ${b.max_lat.toFixed(6)}, ${b.max_lon.toFixed(6)}`;
+
+      const bounds = [
+        [b.min_lat, b.min_lon],
+        [b.max_lat, b.max_lon]
+      ];
+
+      if (boundaryLayer) map.removeLayer(boundaryLayer);
+      boundaryLayer = L.rectangle(bounds, {
+        weight: 2,
+        opacity: 0.9,
+        fillOpacity: 0.04
+      }).addTo(map);
+
+      map.fitBounds(bounds, { padding: [20, 20] });
+    } catch (err) {
+      boundaryOut.textContent = 'Failed to load';
+    }
+  }
+
+  function pointInsideBoundary(p) {
+    if (!boundaryBounds || !p) return true;
+    return (
+      p.lat >= boundaryBounds.min_lat &&
+      p.lat <= boundaryBounds.max_lat &&
+      p.lon >= boundaryBounds.min_lon &&
+      p.lon <= boundaryBounds.max_lon
+    );
+  }
+
+  function setMode(mode) {
+    clickMode = mode;
+    modeStartBtn.classList.toggle('active', mode === 'start');
+    modeEndBtn.classList.toggle('active', mode === 'end');
+  }
+
+  modeStartBtn.onclick = () => setMode('start');
+  modeEndBtn.onclick = () => setMode('end');
+
+  function formatPoint(p) {
+    if (!p) return 'Not set';
+    return `${p.lat.toFixed(6)}, ${p.lon.toFixed(6)}`;
+  }
+
+  function renderNearestPoi(obj) {
+    if (!obj || !obj.nearest_poi) {
+      poiOut.textContent = 'No POI found.';
+      return;
+    }
+    poiOut.textContent = JSON.stringify(obj.nearest_poi, null, 2);
+  }
+
+  async function fetchNearest(lat, lon) {
+    const res = await fetch(`/nearest_poi?lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}`);
+    if (!res.ok) {
+      renderNearestPoi(null);
+      return;
+    }
+    const data = await res.json();
+    renderNearestPoi(data);
+  }
+
+  function clearRoutes() {
+    for (const layer of routeLayers) map.removeLayer(layer);
+    routeLayers = [];
+    routesOut.innerHTML = 'No routes yet.';
+    usedOut.textContent = '-';
+  }
+
+  function clearAll() {
+    startPoint = null;
+    endPoint = null;
+    if (startMarker) map.removeLayer(startMarker);
+    if (endMarker) map.removeLayer(endMarker);
+    startMarker = null;
+    endMarker = null;
+    startOut.textContent = 'Not set';
+    endOut.textContent = 'Not set';
+    poiOut.textContent = 'No point selected.';
+    clearRoutes();
+  }
+
+  document.getElementById('btn-clear').onclick = clearAll;
+
+  map.on('click', async (e) => {
+    const p = { lat: e.latlng.lat, lon: e.latlng.lng };
+    if (!pointInsideBoundary(p)) {
+      alert('This point is outside the road-data boundary. Please choose a point inside the rectangle.');
+      return;
+    }
+
+    if (clickMode === 'start') {
+      startPoint = p;
+      if (startMarker) map.removeLayer(startMarker);
+      startMarker = L.marker([p.lat, p.lon]).addTo(map).bindPopup('Start');
+      startOut.textContent = formatPoint(p);
+      setMode('end');
+    } else {
+      endPoint = p;
+      if (endMarker) map.removeLayer(endMarker);
+      endMarker = L.marker([p.lat, p.lon]).addTo(map).bindPopup('End');
+      endOut.textContent = formatPoint(p);
+      setMode('start');
+    }
+
+    await fetchNearest(p.lat, p.lon);
+  });
+
+  function renderRoutes(data) {
+    clearRoutes();
+    usedOut.textContent = data.used_routing || '-';
+
+    const routeCards = [];
+    const routeStyles = [
+      { weight: 6, opacity: 0.9 },
+      { weight: 5, opacity: 0.75 },
+      { weight: 4, opacity: 0.6 }
+    ];
+
+    for (let i = 0; i < (data.features || []).length; i++) {
+      const f = data.features[i];
+      const style = routeStyles[i] || { weight: 4, opacity: 0.5 };
+      const layer = L.geoJSON(f, { style }).addTo(map);
+      routeLayers.push(layer);
+
+      const p = f.properties || {};
+      routeCards.push(
+        `<div class=\"route-card\">` +
+        `<div class=\"route-title\">Route #${p.rank}</div>` +
+        `<div>Distance: ${p.distance_m} m</div>` +
+        `<div>Duration: ${p.duration_s} s (${p.duration_min} min)</div>` +
+        `<div>Mode: ${p.mode}</div>` +
+        `</div>`
+      );
+    }
+
+    routesOut.innerHTML = routeCards.length ? routeCards.join('') : 'No routes returned.';
+
+    const allLayers = [];
+    if (startMarker) allLayers.push(startMarker);
+    if (endMarker) allLayers.push(endMarker);
+    allLayers.push(...routeLayers);
+    try {
+      const group = L.featureGroup(allLayers);
+      map.fitBounds(group.getBounds().pad(0.2));
+    } catch (e) {}
+  }
+
+  document.getElementById('btn-route').onclick = async () => {
+    if (!startPoint || !endPoint) {
+      alert('Please set both Start and End on the map.');
+      return;
+    }
+
+    const payload = {
+      start_lat: startPoint.lat,
+      start_lon: startPoint.lon,
+      end_lat: endPoint.lat,
+      end_lon: endPoint.lon,
+      mode: document.getElementById('mode-select').value,
+      k: parseInt(document.getElementById('k-input').value || '3', 10),
+      snap_to_poi: document.getElementById('snap-to-poi').checked,
+      fallback_to_raw: document.getElementById('fallback-to-raw').checked,
+      poi_candidates: parseInt(document.getElementById('poi-candidates').value || '3', 10)
+    };
+
+    clearRoutes();
+    routesOut.innerHTML = 'Routing...';
+
+    const res = await fetch('/route_top3', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    const data = await res.json();
+    if (!res.ok) {
+      routesOut.innerHTML = `<pre>${JSON.stringify(data, null, 2)}</pre>`;
+      return;
+    }
+
+    renderRoutes(data);
+  };
+
+  loadBoundary();
+</script>
+</body>
+</html>"""
+    )
+
+
+@app.get("/_info")
+def info():
+    return {
+        "file": __file__,
+        "cwd": os.getcwd(),
+        "routes": [
+            {"path": r.path, "name": r.name, "methods": sorted(list(r.methods or []))}
+            for r in app.router.routes
+        ],
+    }
+
+
+roads = gpd.read_file(ROADS_PATH).to_crs(epsg=3857)
+roads_noded = node_roads_preserve_attrs(roads)
+engine = RouteEngine(roads_noded)
+
+pois = load_pois_csv(POIS_PATH)
+
+if str(getattr(pois, "crs", "")) != "EPSG:4326":
+    pois = pois.to_crs("EPSG:4326")
+
+# Keep POIs in EPSG:4326 for payloads
+_poi_geoms = list(pois.geometry)
+_poi_tree = STRtree(_poi_geoms)
+
+# Also build a meter-based index (EPSG:3857) for accurate distance filtering (e.g., 20m rule)
+_pois_3857 = pois.to_crs("EPSG:3857")
+_poi_geoms_3857 = list(_pois_3857.geometry)
+_poi_tree_3857 = STRtree(_poi_geoms_3857)
+# Map geometry object id -> row index for fast lookup when STRtree returns geometries
+_poi_geom_id_to_idx_3857 = {id(g): i for i, g in enumerate(_poi_geoms_3857)}
+
+
+def _nearest_poi_index(lat: float, lon: float) -> int:
+    q = Point(lon, lat)
+    nearest = _poi_tree.nearest(q)
+    if nearest is None:
+        raise HTTPException(404, "No POI found.")
+    if isinstance(nearest, (int, np.integer)):
+        return int(nearest)
+    return _poi_geoms.index(nearest)
+
+
+def _hits_to_indices(hits, id_to_idx):
+    """Convert STRtree query results to integer indices (supports Shapely 1.x geometries or Shapely 2.x indices)."""
+    out = []
+    for h in hits:
+        if isinstance(h, (int, np.integer)):
+            out.append(int(h))
+        else:
+            idx = id_to_idx.get(id(h))
+            if idx is not None:
+                out.append(int(idx))
+    return out
+
+
+def _poi_candidates_within_20m(lat: float, lon: float, limit: int = 10):
+    """Return POI row indices within 20m of (lat, lon), sorted by distance ascending (meters)."""
+    limit = max(1, min(50, int(limit)))
+
+    q_ll = Point(lon, lat)
+    q_3857 = gpd.GeoSeries([q_ll], crs="EPSG:4326").to_crs("EPSG:3857").iloc[0]
+
+    # Query POIs within a 20m buffer
+    buf = q_3857.buffer(20.0)
+    hits = _poi_tree_3857.query(buf)
+    idxs = _hits_to_indices(hits, _poi_geom_id_to_idx_3857)
+    if not idxs:
+        return []
+
+    # Compute distances in meters and sort
+    dists = []
+    for idx in set(idxs):
+        g = _poi_geoms_3857[idx]
+        dists.append((float(q_3857.distance(g)), int(idx)))
+
+    dists.sort(key=lambda x: x[0])
+    return [idx for _, idx in dists[:limit]]
+
+
+def _poi_payload(idx: int):
+    row = pois.iloc[idx]
+    props = {}
+    for k, v in row.drop(labels=["geometry"]).to_dict().items():
+        props[k] = _json_safe(v)
+    props["poi_latitude"] = _json_safe(float(row.geometry.y))
+    props["poi_longitude"] = _json_safe(float(row.geometry.x))
+    return props
+
+
+def _distance_m_approx(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    g = gpd.GeoSeries([Point(lon1, lat1), Point(lon2, lat2)], crs="EPSG:4326").to_crs("EPSG:3857")
+    return float(g.iloc[0].distance(g.iloc[1]))
+
+
+class RouteReq(BaseModel):
+    start_lat: float
+    start_lon: float
+    end_lat: float
+    end_lon: float
+    mode: str = "car"
+    k: int = 3
+    snap_to_poi: bool = True
+    fallback_to_raw: bool = True  # if POI-snapped routing fails, retry using raw coordinates
+    poi_candidates: int = 3        # max POI candidates (within 20m) to try for start/end
+
+
+@app.get("/health")
+def health():
+    return {"ok": True, "roads_segments": int(len(engine.roads)), "pois": int(len(pois))}
+
+
+@app.get("/graph_stats")
+def graph_stats():
+    """Basic stats for the routing graph to diagnose disconnected networks."""
+    G = getattr(engine, "G", None)
+    if G is None:
+        return {"ok": False, "error": "RouteEngine has no attribute 'G'"}
+
+    # connected components (undirected view)
+    Gu = G.to_undirected(as_view=True)
+    comps = list(nx.connected_components(Gu))
+    comp_sizes = sorted([len(c) for c in comps], reverse=True)
+
+    return {
+        "ok": True,
+        "nodes": int(G.number_of_nodes()),
+        "edges": int(G.number_of_edges()),
+        "components": int(len(comps)),
+        "largest_component_nodes": int(comp_sizes[0]) if comp_sizes else 0,
+        "top5_component_sizes": comp_sizes[:5],
+    }
+
+
+@app.get("/roads_bounds")
+def roads_bounds():
+    minx, miny, maxx, maxy = engine.roads.total_bounds
+    pts = gpd.GeoSeries([Point(minx, miny), Point(maxx, maxy)], crs="EPSG:3857").to_crs("EPSG:4326")
+    pmin, pmax = pts.iloc[0], pts.iloc[1]
+    return {
+        "crs": "EPSG:4326",
+        "min_lon": float(pmin.x),
+        "min_lat": float(pmin.y),
+        "max_lon": float(pmax.x),
+        "max_lat": float(pmax.y),
+    }
+
+
+@app.get("/suggest_points")
+def suggest_points(n: int = 5):
+    n = max(1, min(50, n))
+    sampled = []
+    roads_ll = engine.roads.to_crs("EPSG:4326")
+    step = max(1, len(roads_ll) // n)
+    for i in range(0, len(roads_ll), step):
+        if len(sampled) >= n:
+            break
+        geom = roads_ll.geometry.iloc[i]
+        if geom is None or geom.is_empty:
+            continue
+        try:
+            p = geom.interpolate(0.5, normalized=True)
+        except Exception:
+            continue
+        sampled.append({"lon": float(p.x), "lat": float(p.y)})
+    return {"count": len(sampled), "points": sampled}
+
+
+@app.get("/suggest_pair")
+def suggest_pair():
+    """Return a start/end pair sampled from the SAME road geometry (EPSG:4326) for reliable routing tests."""
+    roads_ll = engine.roads.to_crs("EPSG:4326")
+    for i in range(len(roads_ll)):
+        geom = roads_ll.geometry.iloc[i]
+        if geom is None or geom.is_empty:
+            continue
+        # handle MultiLineString by taking the longest part
+        try:
+            if geom.geom_type == "MultiLineString":
+                geom = max(list(geom.geoms), key=lambda g: g.length)
+        except Exception:
+            pass
+
+        try:
+            p1 = geom.interpolate(0.25, normalized=True)
+            p2 = geom.interpolate(0.75, normalized=True)
+        except Exception:
+            continue
+
+        start = {"lon": float(p1.x), "lat": float(p1.y)}
+        end = {"lon": float(p2.x), "lat": float(p2.y)}
+
+        # Also show nearest POIs to these points (useful for POI-snap debugging)
+        try:
+            s_idx = _nearest_poi_index(start["lat"], start["lon"])
+            e_idx = _nearest_poi_index(end["lat"], end["lon"])
+            start_poi = _poi_payload(s_idx)
+            end_poi = _poi_payload(e_idx)
+        except Exception:
+            start_poi = None
+            end_poi = None
+
+        return {
+            "start": start,
+            "end": end,
+            "nearest_poi": {"start": start_poi, "end": end_poi},
+        }
+
+    raise HTTPException(404, "No suitable road geometry found to suggest a pair.")
+
+
+@app.get("/nearest_poi")
+def nearest_poi(lat: float, lon: float):
+    idx = _nearest_poi_index(lat, lon)
+    props = _poi_payload(idx)
+    return {"query": {"lat": float(lat), "lon": float(lon)}, "nearest_poi": props}
+
+
+@app.post("/route_top3")
+def route_top3(req: RouteReq):
+    mode = req.mode.strip().lower()
+    if mode not in ("car", "motorcycle"):
+        raise HTTPException(400, "mode must be 'car' or 'motorcycle'")
+
+    print(
+        f"[route_tool] /route_top3 start | mode={mode} k={req.k} snap_to_poi={req.snap_to_poi} "
+        f"fallback_to_raw={req.fallback_to_raw} poi_candidates={req.poi_candidates}"
+    )
+
+    try:
+        def _try_route(sl: float, so: float, el: float, eo: float):
+            print(f"[route_tool] full route try | start=({sl:.6f},{so:.6f}) end=({el:.6f},{eo:.6f}) k={req.k}")
+            return engine.route_top3(
+                so,
+                sl,
+                eo,
+                el,
+                mode=mode,
+                k=req.k,
+            )
+
+        def _try_route_fast(sl: float, so: float, el: float, eo: float):
+            # Lightweight route existence check while evaluating POI candidate pairs
+            print(f"[route_tool] fast route try | start=({sl:.6f},{so:.6f}) end=({el:.6f},{eo:.6f})")
+            return engine.route_top3(
+                so,
+                sl,
+                eo,
+                el,
+                mode=mode,
+                k=1,
+            )
+
+        used = "raw"
+        snap_info = None
+
+        # Pass 1: POI-snapped routing (strict 20m rule + try alternates within 20m)
+        if req.snap_to_poi:
+            cand_limit = int(req.poi_candidates)
+            s_cands = _poi_candidates_within_20m(req.start_lat, req.start_lon, limit=cand_limit)
+            e_cands = _poi_candidates_within_20m(req.end_lat, req.end_lon, limit=cand_limit)
+
+            # If either side has no POI within 20m, skip POI snapping entirely
+            if not s_cands or not e_cands:
+                start_lat, start_lon = float(req.start_lat), float(req.start_lon)
+                end_lat, end_lon = float(req.end_lat), float(req.end_lon)
+                print("[route_tool] fallback to raw | reason=no_poi_within_20m")
+                routes = _try_route(start_lat, start_lon, end_lat, end_lon)
+                used = "raw" if routes else used
+                snap_info = {
+                    "rule": "20m",
+                    "status": "skipped",
+                    "reason": "no_poi_within_20m",
+                    "start_has_poi": bool(s_cands),
+                    "end_has_poi": bool(e_cands),
+                }
+            else:
+                # Build sorted candidate POIs with distances for transparency
+                def _cand_info(lat, lon, idxs):
+                    out = []
+                    for idx in idxs:
+                        p = _poi_payload(idx)
+                        d = _distance_m_approx(lat, lon, float(p["poi_latitude"]), float(p["poi_longitude"]))
+                        out.append({"idx": int(idx), "dist_m": float(d), "poi": p})
+                    out.sort(key=lambda x: x["dist_m"])
+                    return out
+
+                s_infos = _cand_info(req.start_lat, req.start_lon, s_cands)
+                e_infos = _cand_info(req.end_lat, req.end_lon, e_cands)
+
+                # Preselect the nearest candidate on each side for a fast first attempt
+                nearest_start = s_infos[0] if s_infos else None
+                nearest_end = e_infos[0] if e_infos else None
+
+                snap_info = {
+                    "rule": "20m",
+                    "status": "attempted",
+                    "start": {"input": {"lat": float(req.start_lat), "lon": float(req.start_lon)}, "candidates": s_infos},
+                    "end": {"input": {"lat": float(req.end_lat), "lon": float(req.end_lon)}, "candidates": e_infos},
+                }
+
+                routes = []
+                chosen = None
+
+                # Fast first attempt: nearest start POI + nearest end POI
+                if nearest_start is not None and nearest_end is not None:
+                    sl = float(nearest_start["poi"]["poi_latitude"])
+                    so = float(nearest_start["poi"]["poi_longitude"])
+                    el = float(nearest_end["poi"]["poi_latitude"])
+                    eo = float(nearest_end["poi"]["poi_longitude"])
+                    routes = _try_route_fast(sl, so, el, eo)
+                    if routes:
+                        chosen = {"start": nearest_start, "end": nearest_end, "pairs_tried": 1}
+                        start_lat, start_lon = sl, so
+                        end_lat, end_lon = el, eo
+                        used = "poi"
+
+                # Try combinations, closest-first (small bounded search)
+                max_pairs = 4
+                pairs_tried = 0 if not chosen else 1
+                for si in s_infos:
+                    if chosen:
+                        break
+                    for ei in e_infos:
+                        pairs_tried += 1
+                        if pairs_tried > max_pairs:
+                            break
+                        sl = float(si["poi"]["poi_latitude"])
+                        so = float(si["poi"]["poi_longitude"])
+                        el = float(ei["poi"]["poi_latitude"])
+                        eo = float(ei["poi"]["poi_longitude"])
+                        routes = _try_route_fast(sl, so, el, eo)
+                        if routes:
+                            chosen = {"start": si, "end": ei, "pairs_tried": pairs_tried}
+                            start_lat, start_lon = sl, so
+                            end_lat, end_lon = el, eo
+                            used = "poi"
+                            break
+                    if routes or pairs_tried > max_pairs:
+                        break
+
+                if chosen:
+                    snap_info["status"] = "used_poi"
+                    snap_info["chosen"] = chosen
+                    # Rerun full routing for the chosen POI pair using the requested k
+                    routes = _try_route(start_lat, start_lon, end_lat, end_lon)
+                else:
+                    snap_info["status"] = "failed_poi"
+                    snap_info["pairs_tried"] = pairs_tried
+                    # Pass 2: fallback to raw coordinates if enabled
+                    if req.fallback_to_raw:
+                        start_lat, start_lon = float(req.start_lat), float(req.start_lon)
+                        end_lat, end_lon = float(req.end_lat), float(req.end_lon)
+                        print("[route_tool] fallback to raw | reason=failed_poi_candidates")
+                        routes = _try_route(start_lat, start_lon, end_lat, end_lon)
+                        used = "raw" if routes else used
+        else:
+            # Raw routing only
+            start_lat, start_lon = float(req.start_lat), float(req.start_lon)
+            end_lat, end_lon = float(req.end_lat), float(req.end_lon)
+            routes = _try_route(start_lat, start_lon, end_lat, end_lon)
+            used = "raw" if routes else used
+
+        if not routes:
+            raise HTTPException(404, "No route found.")
+
+    except HTTPException:
+        raise
+    except nx.NetworkXNoPath:
+        raise HTTPException(404, "No route found (disconnected road network between snapped points).")
+    except Exception as e:
+        print("[route_tool] ERROR in /route_top3")
+        traceback.print_exc()
+        raise HTTPException(400, str(e))
+
+    features = []
+    for r in routes:
+        geom_ll = gpd.GeoSeries([r.geometry_3857], crs="EPSG:3857").to_crs("EPSG:4326").iloc[0]
+        features.append(
+            {
+                "type": "Feature",
+                "properties": {
+                    "rank": r.rank,
+                    "distance_m": round(r.distance_m, 2),
+                    "duration_s": round(r.duration_s, 2),
+                    "duration_min": round(r.duration_s / 60.0, 2),
+                    "mode": mode,
+                },
+                "geometry": mapping(geom_ll),
+            }
+        )
+
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "routing_endpoints": {
+            "start": {"lat": float(start_lat), "lon": float(start_lon)},
+            "end": {"lat": float(end_lat), "lon": float(end_lon)},
+        },
+        "poi_snap": snap_info,
+        "used_routing": used,
+    }
