@@ -1,9 +1,9 @@
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
-pandas==2.1.4
-geopandas==0.14.4
-shapely==2.0.4
-pyproj==3.6.1
+pandas
+geopandas
+shapely
+pyproj
 networkx==3.3
-rtree==1.2.0
-numpy==1.26.4
+rtree
+numpy
