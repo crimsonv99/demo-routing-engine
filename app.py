@@ -244,7 +244,7 @@ def map_ui():
       <div class="row"><div class="label">Start</div><div id="start-out" class="value">Not set</div></div>
       <div class="row"><div class="label">End</div><div id="end-out" class="value">Not set</div></div>
       <div class="row"><div class="label">Routing used</div><div id="used-out" class="value">-</div></div>
-      <div class="row"><div class="label">Road boundary</div><div id="boundary-out" class="value">Loading...</div></div>
+      <div class="row"><div class="label">POI coverage boundary</div><div id="boundary-out" class="value">Loading...</div></div>
     </div>
 
     <div class="section">
@@ -419,8 +419,8 @@ def map_ui():
     const p = { lat: e.latlng.lat, lon: e.latlng.lng };
     if (!pointInsideBoundary(p)) {
       showError(
-        'Point outside road data',
-        'Please click inside the grey rectangle that marks the available road data area.'
+        'Point outside POI coverage',
+        'Please click inside the grey rectangle that marks the area where POI data is available.'
       );
       return;
     }
@@ -728,13 +728,70 @@ def graph_stats():
 
 @app.get("/roads_bounds")
 def roads_bounds():
-    minx, miny, maxx, maxy = engine.roads.total_bounds
-    pts = gpd.GeoSeries([Point(minx, miny), Point(maxx, maxy)], crs="EPSG:3857").to_crs("EPSG:4326")
-    pmin, pmax = pts.iloc[0], pts.iloc[1]
+    """
+    Return a boundary suitable for UI point-picking.
+    Priority: overlap of road bbox and POI bbox, so users stay inside the area
+    where both routing roads and POI coverage exist.
+    Fallback: POI bbox if overlap is invalid, then road bbox if POI is empty.
+    """
+    # Road bounds are stored in EPSG:3857, convert corner points to EPSG:4326
+    r_minx, r_miny, r_maxx, r_maxy = engine.roads.total_bounds
+    road_pts = gpd.GeoSeries([Point(r_minx, r_miny), Point(r_maxx, r_maxy)], crs="EPSG:3857").to_crs("EPSG:4326")
+    road_min, road_max = road_pts.iloc[0], road_pts.iloc[1]
+    road_bbox = {
+        "min_lon": float(road_min.x),
+        "min_lat": float(road_min.y),
+        "max_lon": float(road_max.x),
+        "max_lat": float(road_max.y),
+    }
+
+    # POI bounds are already EPSG:4326
+    try:
+        p_minx, p_miny, p_maxx, p_maxy = pois.total_bounds
+        poi_bbox = {
+            "min_lon": float(p_minx),
+            "min_lat": float(p_miny),
+            "max_lon": float(p_maxx),
+            "max_lat": float(p_maxy),
+        }
+        has_poi = np.isfinite([p_minx, p_miny, p_maxx, p_maxy]).all()
+    except Exception:
+        poi_bbox = None
+        has_poi = False
+
+    # Prefer overlap between road bbox and POI bbox
+    if has_poi and poi_bbox is not None:
+        overlap = {
+            "min_lon": max(road_bbox["min_lon"], poi_bbox["min_lon"]),
+            "min_lat": max(road_bbox["min_lat"], poi_bbox["min_lat"]),
+            "max_lon": min(road_bbox["max_lon"], poi_bbox["max_lon"]),
+            "max_lat": min(road_bbox["max_lat"], poi_bbox["max_lat"]),
+        }
+        if overlap["min_lon"] < overlap["max_lon"] and overlap["min_lat"] < overlap["max_lat"]:
+            return {
+                "crs": "EPSG:4326",
+                **overlap,
+                "source": "road_poi_overlap",
+                "road_bbox": road_bbox,
+                "poi_bbox": poi_bbox,
+            }
+
+        # If overlap is invalid, fall back to POI bbox to keep UI constrained to POI area
+        return {
+            "crs": "EPSG:4326",
+            **poi_bbox,
+            "source": "poi_bbox",
+            "road_bbox": road_bbox,
+            "poi_bbox": poi_bbox,
+        }
+
+    # Final fallback if POI dataset is empty/unavailable
     return {
         "crs": "EPSG:4326",
-        "min_lon": float(pmin.x), "min_lat": float(pmin.y),
-        "max_lon": float(pmax.x), "max_lat": float(pmax.y),
+        **road_bbox,
+        "source": "road_bbox",
+        "road_bbox": road_bbox,
+        "poi_bbox": poi_bbox,
     }
 
 
