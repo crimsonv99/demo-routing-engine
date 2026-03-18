@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     # ── Data paths ────────────────────────────────────────────────────────
     roads_path: str = "data/test_road.geojson"
     pois_path: str = "data/VN Sample Data.csv"
+    restrictions_path: str = ""  # optional — leave empty to disable turn restrictions
 
     # ── Routing defaults ─────────────────────────────────────────────────
     default_k: int = 3

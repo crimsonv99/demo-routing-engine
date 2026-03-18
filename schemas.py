@@ -79,6 +79,7 @@ class RouteFeature(BaseModel):
 
 
 class RouteResponse(BaseModel):
+    trip_id: Optional[str] = None
     type: str = "FeatureCollection"
     features: List[RouteFeature]
     routing_endpoints: Dict[str, LatLon]
@@ -90,7 +91,9 @@ class RouteResponse(BaseModel):
 
 class NearestPoiResponse(BaseModel):
     query: LatLon
-    nearest_poi: Dict[str, Any]
+    nearest_poi: Optional[Dict[str, Any]]  # None if no POI within snap_radius_m
+    distance_m: float                       # distance to nearest POI in metres
+    within_snap_radius: bool                # True if within default 20m snap radius
 
 
 # ── Health / Stats ────────────────────────────────────────────────────────────
@@ -117,6 +120,23 @@ class BoundsResponse(BaseModel):
     min_lat: float
     max_lon: float
     max_lat: float
+
+
+# ── Trip record ───────────────────────────────────────────────────────────────
+
+class TripRecord(BaseModel):
+    """
+    Snapshot of a planned trip created by POST /routes.
+
+    planned_coords holds the [lon, lat] sequence of the best route (rank 0)
+    so downstream tooling can compare a user's actual GPS trace against it
+    without having to unwrap the full GeoJSON response.
+    """
+    trip_id: str
+    created_at: str                    # ISO-8601 UTC, e.g. "2026-03-17T10:23:45Z"
+    request: Dict[str, Any]            # original RouteRequest params
+    planned_coords: List[List[float]]  # [[lon, lat], …] best route geometry
+    response: RouteResponse            # full API response for reference
 
 
 # ── Standard error wrapper ────────────────────────────────────────────────────

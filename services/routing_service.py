@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import geopandas as gpd
@@ -16,7 +17,7 @@ from preprocess import node_roads_preserve_attrs
 from poi_loader import load_pois_csv
 from schemas import (
     LatLon, PoiInfo, RouteFeature, RouteProperties,
-    RouteSummary, GeoJSONGeometry, RouteResponse, SnapInfo,
+    RouteSummary, GeoJSONGeometry, RouteResponse, SnapInfo, TripRecord,
 )
 
 logger = logging.getLogger(__name__)
@@ -106,6 +107,7 @@ class RoutingService:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self._trips: Dict[str, TripRecord] = {}
         self._load_roads()
         self._load_pois()
         logger.info(
@@ -116,10 +118,25 @@ class RoutingService:
     # ── Initialisation ────────────────────────────────────────────────────
 
     def _load_roads(self) -> None:
+        import os
         logger.info("Loading roads from %s", self.settings.roads_path)
         roads = gpd.read_file(self.settings.roads_path).to_crs(epsg=3857)
-        roads_noded = node_roads_preserve_attrs(roads)
-        self.engine = RouteEngine(roads_noded)
+        # already_split=True when loading pre-noded file (from split_lines_standalone.py)
+        # skips the 20-min intersection pass — does vectorised cleanup only (~seconds)
+        already_split = "split" in self.settings.roads_path.lower()
+        roads_noded = node_roads_preserve_attrs(roads, already_split=already_split)
+
+        # Use RESTRICTIONS_PATH from .env if set, otherwise disabled
+        restrictions_path = self.settings.restrictions_path or None
+        if restrictions_path and os.path.exists(restrictions_path):
+            logger.info("Found restrictions: %s", restrictions_path)
+        elif restrictions_path:
+            logger.warning("Restrictions file not found: %s — turn restrictions disabled", restrictions_path)
+            restrictions_path = None
+        else:
+            logger.info("RESTRICTIONS_PATH not set — turn restrictions disabled")
+
+        self.engine = RouteEngine(roads_noded, restrictions_path=restrictions_path)
         logger.info("Road graph ready | nodes=%d edges=%d",
                     self.engine.G.number_of_nodes(),
                     self.engine.G.number_of_edges())
@@ -321,7 +338,7 @@ class RoutingService:
                     rank=r.rank,
                     distance_m=round(r.distance_m, 2),
                     duration_s=round(r.duration_s, 2),
-                    duration_min=round(r.duration_s / 60.0, 2),
+                    duration_min=math.ceil(r.duration_s / 60.0),
                     mode=mode,
                     summary=RouteSummary(start=start_txt, end=end_txt, used_routing=used),
                     instructions=instructions,
@@ -329,6 +346,34 @@ class RoutingService:
                 geometry=GeoJSONGeometry(type=geo["type"], coordinates=geo["coordinates"]),
             ))
         return features
+
+    # ── Trip store ────────────────────────────────────────────────────────
+
+    def store_trip(
+        self,
+        trip_id: str,
+        req_dict: Dict[str, Any],
+        response: RouteResponse,
+    ) -> TripRecord:
+        """Persist a planned trip keyed by trip_id."""
+        planned_coords: List[List[float]] = []
+        if response.features:
+            planned_coords = list(response.features[0].geometry.coordinates)
+
+        record = TripRecord(
+            trip_id=trip_id,
+            created_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            request=req_dict,
+            planned_coords=planned_coords,
+            response=response,
+        )
+        self._trips[trip_id] = record
+        logger.info("trip stored | id=%s routes=%d", trip_id, len(response.features))
+        return record
+
+    def get_trip(self, trip_id: str) -> Optional[TripRecord]:
+        """Return a stored TripRecord, or None if not found."""
+        return self._trips.get(trip_id)
 
     # ── Graph stats ───────────────────────────────────────────────────────
 

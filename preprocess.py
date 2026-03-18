@@ -1,111 +1,108 @@
 from __future__ import annotations
-from typing import List, Dict, Any
+
+import numpy as np
 import geopandas as gpd
-from shapely.geometry import LineString, Point, MultiPoint
-from shapely.ops import split
+import shapely
+from shapely.geometry import LineString, MultiLineString
+from shapely.ops import unary_union
+from shapely.strtree import STRtree
+from shapely import wkb as shapely_wkb
+
+_SHAPELY_2 = int(shapely.__version__.split(".")[0]) >= 2
 
 
-def _collect_split_points(line: LineString, candidates) -> List[Point]:
-    pts: List[Point] = []
-    for geom in candidates:
-        if geom is None or geom.is_empty:
-            continue
-        inter = line.intersection(geom)
-        if inter.is_empty:
-            continue
-        gtype = inter.geom_type
-        if gtype == "Point":
-            pts.append(inter)
-        elif gtype == "MultiPoint":
-            pts.extend(list(inter.geoms))
-        # LineString overlaps are ignored (rare in clean road data)
-    return pts
-
-
-def _dedup_points(points: List[Point], tol: float = 0.01) -> MultiPoint:
-    """Bucket-deduplicate points at *tol* metre resolution."""
-    seen = set()
-    uniq = []
-    for p in points:
-        key = (round(p.x / tol) * tol, round(p.y / tol) * tol)
-        if key not in seen:
-            seen.add(key)
-            uniq.append(Point(key[0], key[1]))
-    return MultiPoint(uniq)
-
-
-def node_roads_preserve_attrs(roads_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+def node_roads_preserve_attrs(
+    roads_gdf: gpd.GeoDataFrame,
+    already_split: bool = False,
+    min_length_m: float = 0.1,
+) -> gpd.GeoDataFrame:
     """
-    Split each road feature at intersections with all other roads, preserving
-    all non-geometry attributes on every resulting sub-segment.
+    Prepare road GeoDataFrame for the routing graph.
 
-    Assumes roads_gdf is already in a METRIC CRS (EPSG:3857).
+    already_split=True  (default when loading pre-split file)
+        → vectorised cleanup only: explode, filter, drop tiny segments.
+          Completes in seconds regardless of feature count.
 
-    Improvements vs original:
-    - Progress logging every 500 rows so long preprocessing isn't silent.
-    - Spatial index is built *after* explode/reset so iloc lookups are safe.
-    - Tiny segments (< 0.1 m) are dropped to avoid near-zero-length graph edges.
+    already_split=False  (raw OSM download, not yet noded)
+        → unary_union to node entire network in GEOS (C),
+          then vectorised attribute lookup via STRtree.nearest.
+          Much faster than the old per-feature Python loop.
     """
+
+    # ── 1. basic cleanup (always) ─────────────────────────────────────────────
     roads = roads_gdf.copy()
     roads = roads[roads.geometry.notnull()].copy()
-    roads = roads[roads.geometry.type.isin(["LineString", "MultiLineString"])].copy()
     roads = roads.explode(index_parts=False).reset_index(drop=True)
+    roads = roads[roads.geometry.geom_type == "LineString"].copy()
+    roads = roads[roads.geometry.apply(lambda g: len(g.coords) >= 2)].copy()
 
-    n_total = len(roads)
-    print(f"[preprocess] node_roads: {n_total} segments to process")
+    # Drop sub-threshold fragments (vectorised)
+    roads = roads[roads.geometry.length >= min_length_m].copy()
+    roads = roads.reset_index(drop=True)
 
-    # Build sindex after explode/reset so positional indices are contiguous.
-    sindex = roads.sindex
+    n = len(roads)
+    print(f"[preprocess] {n:,} segments after basic cleanup")
 
-    out_rows: List[Dict[str, Any]] = []
+    if already_split or n == 0:
+        # Data is already noded — nothing more to do
+        print(f"[preprocess] already_split=True → skipping intersection pass")
+        print(f"[preprocess] done: {n:,} segments ready")
+        return roads
 
-    for i in range(n_total):
-        if i > 0 and i % 500 == 0:
-            print(f"[preprocess] {i}/{n_total} segments processed, {len(out_rows)} output rows so far")
+    # ── 2. node via GEOS unary_union (raw data path) ──────────────────────────
+    print("[preprocess] Noding via GEOS unary_union …")
+    original_lines = roads.geometry.tolist()
+    noded = unary_union(original_lines)
 
-        row = roads.iloc[i]
-        line: LineString = row.geometry
-        if line is None or line.is_empty or line.geom_type != "LineString":
-            continue
+    if noded is None or noded.is_empty:
+        print("[preprocess] warning: unary_union empty — returning cleaned input")
+        return roads
 
-        # Candidate neighbours by bounding-box overlap
-        cand_idx = list(sindex.intersection(line.bounds))
-        cand_geoms = [roads.iloc[j].geometry for j in cand_idx if j != i]
+    if noded.geom_type == "MultiLineString":
+        valid_segs = [g for g in noded.geoms
+                      if isinstance(g, LineString) and len(g.coords) >= 2
+                      and g.length >= min_length_m]
+    elif noded.geom_type == "LineString":
+        valid_segs = [noded] if noded.length >= min_length_m else []
+    else:
+        valid_segs = [g for g in getattr(noded, "geoms", [])
+                      if isinstance(g, LineString)
+                      and len(g.coords) >= 2
+                      and g.length >= min_length_m]
 
-        pts = _collect_split_points(line, cand_geoms)
+    print(f"[preprocess] {len(valid_segs):,} segments after noding")
 
-        # Drop split points that coincide with the line's own endpoints
-        start = Point(line.coords[0])
-        end = Point(line.coords[-1])
-        filtered = [
-            p for p in pts
-            if p.distance(start) >= 0.05 and p.distance(end) >= 0.05
-        ]
+    # ── 3. attribute lookup ───────────────────────────────────────────────────
+    tree = STRtree(original_lines)
+    attr_cols = [c for c in roads.columns if c != "geometry"]
+    records = roads[attr_cols].to_dict("records")
 
-        base_attrs = row.drop(labels=["geometry"]).to_dict()
+    if _SHAPELY_2:
+        import numpy as np
+        wkb_bytes  = [s.wkb for s in valid_segs]
+        segs_arr   = shapely.from_wkb(wkb_bytes)
+        mids_arr   = shapely.line_interpolate_point(segs_arr, 0.5, normalized=True)
+        parent_idx = tree.nearest(mids_arr).astype(int)
+    else:
+        id_to_idx  = {id(ln): i for i, ln in enumerate(original_lines)}
+        from shapely.geometry import Point
+        wkb_bytes  = []
+        parent_idx = []
+        for seg in valid_segs:
+            mid = Point(seg.coords[len(seg.coords) // 2])
+            near = tree.nearest(mid)
+            parent_idx.append(id_to_idx.get(id(near), 0))
+            wkb_bytes.append(seg.wkb)
+        parent_idx = parent_idx  # keep as list, handled below
 
-        if not filtered:
-            out = dict(base_attrs)
-            out["geometry"] = line
-            out_rows.append(out)
-            continue
+    # ── 4. assemble output ────────────────────────────────────────────────────
+    rows = []
+    for k, seg in enumerate(valid_segs):
+        pidx = int(parent_idx[k])
+        row = dict(records[pidx])
+        row["geometry"] = seg
+        rows.append(row)
 
-        mp = _dedup_points(filtered, tol=0.05)  # 5 cm bucketing
-        try:
-            pieces = split(line, mp)
-        except Exception as exc:
-            print(f"[preprocess] split failed for segment {i}: {exc} — keeping original")
-            out = dict(base_attrs)
-            out["geometry"] = line
-            out_rows.append(out)
-            continue
-
-        for seg in pieces.geoms:
-            if seg.length < 0.1:   # drop sub-10cm fragments
-                continue
-            out = dict(base_attrs)
-            out["geometry"] = seg
-            out_rows.append(out)
-
-    print(f"[preprocess] done: {n_total} input segments → {len(out_rows)} output segments")
-    return gpd.GeoDataFrame(out_rows, crs=roads_gdf.crs)
+    out = gpd.GeoDataFrame(rows, crs=roads_gdf.crs)
+    print(f"[preprocess] done: {n:,} input → {len(out):,} output segments")
+    return out

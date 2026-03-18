@@ -15,7 +15,7 @@ from config import Settings, get_settings
 from schemas import (
     BoundsResponse, ErrorDetail, ErrorResponse,
     GraphStatsResponse, HealthResponse, NearestPoiResponse,
-    RouteRequest, RouteResponse, LatLon,
+    RouteRequest, RouteResponse, LatLon, TripRecord,
 )
 from services import RoutingService
 
@@ -125,6 +125,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     prefix = cfg.api_prefix
     app.include_router(health_router,  prefix=prefix, tags=["Health"])
     app.include_router(routing_router, prefix=prefix, tags=["Routing"])
+    app.include_router(trips_router,   prefix=prefix, tags=["Trips"])
     app.include_router(poi_router,     prefix=prefix, tags=["POI"])
     app.include_router(map_router,     tags=["Map UI"])
 
@@ -182,7 +183,7 @@ def compute_routes(
         req.start_lat, req.start_lon, req.end_lat, req.end_lon, req.mode, req.k,
     )
     try:
-        return svc.compute_routes(
+        result = svc.compute_routes(
             start_lat=req.start_lat, start_lon=req.start_lon,
             end_lat=req.end_lat,     end_lon=req.end_lon,
             mode=req.mode,
@@ -198,11 +199,35 @@ def compute_routes(
         raise HTTPException(status.HTTP_404_NOT_FOUND,
                             detail="No path exists between the snapped points.")
 
+    trip_id = str(uuid.uuid4())
+    result.trip_id = trip_id
+    svc.store_trip(trip_id, req.model_dump(), result)
+    return result
+
 
 @routing_router.get("/routes/bounds", response_model=BoundsResponse,
                     summary="Bounding box of road data")
 def roads_bounds(svc: RoutingService = Depends(get_service)):
     return BoundsResponse(**svc.roads_bounds())
+
+
+# ── Trips router ──────────────────────────────────────────────────────────────
+
+trips_router = APIRouter()
+
+
+@trips_router.get(
+    "/trips/{trip_id}",
+    response_model=TripRecord,
+    summary="Retrieve a recorded trip by ID",
+    responses={404: {"model": ErrorResponse, "description": "Trip not found"}},
+)
+def get_trip(trip_id: str, svc: RoutingService = Depends(get_service)):
+    record = svc.get_trip(trip_id)
+    if record is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND,
+                            detail=f"Trip '{trip_id}' not found.")
+    return record
 
 
 # ── POI router ────────────────────────────────────────────────────────────────
@@ -218,15 +243,25 @@ poi_router = APIRouter()
 def nearest_poi(
     lat: float,
     lon: float,
+    snap_radius_m: float = 20.0,
     svc: RoutingService = Depends(get_service),
+    cfg: Settings       = Depends(get_settings),
 ):
     try:
         idx = svc.nearest_poi_index(lat, lon)
     except ValueError as e:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail=str(e))
+
+    # Compute actual distance to nearest POI
+    candidates = svc.candidates_within_radius(lat, lon, radius_m=99999, limit=1)
+    dist_m = candidates[0][0] if candidates else float("inf")
+    within = dist_m <= snap_radius_m
+
     return NearestPoiResponse(
         query=LatLon(lat=lat, lon=lon),
-        nearest_poi=svc.poi_payload(idx),
+        nearest_poi=svc.poi_payload(idx) if within else None,
+        distance_m=round(dist_m, 1),
+        within_snap_radius=within,
     )
 
 
@@ -254,7 +289,26 @@ _MAP_HTML_TEMPLATE = """<!doctype html>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <style>
     html,body{height:100%;margin:0;}
-    #wrap{display:flex;height:100%;}
+    #wrap{display:flex;height:100%;position:relative;}
+    #history-panel{
+      position:absolute;top:10px;left:10px;z-index:1000;
+      background:rgba(255,255,255,0.95);border:1px solid #ddd;border-radius:10px;
+      padding:10px 12px;width:230px;max-height:340px;overflow-y:auto;
+      font-family:system-ui,-apple-system,sans-serif;
+      box-shadow:0 2px 12px rgba(0,0,0,0.18);
+    }
+    #history-panel h4{margin:0 0 8px;font-size:13px;color:#374151;font-weight:700;letter-spacing:.3px;}
+    .history-item{
+      cursor:pointer;padding:8px 10px;border-radius:8px;border:1px solid #e5e7eb;
+      margin-bottom:6px;background:white;transition:background .15s;font-size:12px;
+    }
+    .history-item:hover{background:#eff6ff;border-color:#93c5fd;}
+    .history-item.active{background:#dbeafe;border-color:#2563eb;}
+    .hi-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:3px;}
+    .hi-num{font-weight:700;color:#1d4ed8;font-size:12px;}
+    .hi-mode{font-size:11px;color:#6b7280;}
+    .hi-meta{color:#374151;font-weight:600;font-size:12px;}
+    .hi-time{font-size:10px;color:#9ca3af;margin-top:2px;}
     #map{flex:2;}
     #panel{flex:1;padding:12px;font-family:system-ui,-apple-system,sans-serif;overflow:auto;border-left:1px solid #ddd;background:#fafafa;min-width:280px;max-width:380px;}
     .hint{color:#666;font-size:13px;margin-bottom:10px;}
@@ -265,7 +319,7 @@ _MAP_HTML_TEMPLATE = """<!doctype html>
     button{padding:8px 10px;border:1px solid #ccc;background:white;cursor:pointer;border-radius:6px;margin-right:8px;margin-bottom:8px;}
     button.active{border-color:#333;font-weight:700;}
     pre{white-space:pre-wrap;background:white;border:1px solid #ddd;padding:8px;border-radius:6px;font-size:12px;}
-    .route-card{background:white;border:1px solid #ddd;border-radius:8px;padding:10px;margin-bottom:10px;cursor:pointer;}
+    .route-card{cursor:pointer;transition:box-shadow .15s;}
     .route-title{font-weight:700;margin-bottom:6px;}
     .badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;margin-left:6px;}
     .badge-poi{background:#d1fae5;color:#065f46;}
@@ -286,6 +340,10 @@ _MAP_HTML_TEMPLATE = """<!doctype html>
 <body>
 <div id="wrap">
   <div id="map"></div>
+  <div id="history-panel">
+    <h4>&#128199; Trip history</h4>
+    <div id="history-list"><div style="font-size:11px;color:#9ca3af;">No trips yet.</div></div>
+  </div>
   <div id="panel">
     <div id="error-banner"><strong id="err-title"></strong><div id="err-hint" style="margin-top:4px;"></div></div>
     <div class="section">
@@ -293,6 +351,7 @@ _MAP_HTML_TEMPLATE = """<!doctype html>
       <button id="mode-start" class="active">&#128205; Set Start</button>
       <button id="mode-end">&#127937; Set End</button>
       <button id="btn-route">&#128506; Route</button>
+      <button id="btn-reverse" title="Swap start and end">&#8645; Reverse</button>
       <button id="btn-clear">&#10005; Clear</button>
     </div>
     <div class="section">
@@ -354,6 +413,92 @@ var routeLayers = [], routeLabels = [], boundaryBounds = null, lastMode = null;
 var COLORS = ["#2563eb", "#ef4444", "#16a34a"];
 var dragTimer = null;
 
+// ── Trip history ─────────────────────────────────────────────────────────────
+var tripHistory = [];   // [{trip_id, created_at, mode, duration_min, distance_km, data}]
+var activeHistoryIdx = null;
+
+function _nowStr() {
+  var d = new Date();
+  var pad = function(n){return n<10?"0"+n:n;};
+  return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())+" "+
+         pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds());
+}
+
+function addTripToHistory(data) {
+  var f0 = data.features && data.features[0];
+  if (!f0) return;
+  var p = f0.properties || {};
+  var modeIcon = (p.mode === "motorcycle") ? "🏍" : "🚗";
+  var durMin = Math.ceil(p.duration_min);
+  var distKm = ((p.distance_m||0)/1000).toFixed(2);
+  tripHistory.unshift({
+    trip_id: data.trip_id || null,
+    created_at: _nowStr(),
+    mode: p.mode || "car",
+    mode_icon: modeIcon,
+    duration_min: durMin,
+    distance_km: distKm,
+    data: data,
+  });
+  activeHistoryIdx = 0;
+  renderHistoryPanel();
+}
+
+function renderHistoryPanel() {
+  var el = ge("history-list");
+  if (!tripHistory.length) {
+    el.innerHTML = "<div style='font-size:11px;color:#9ca3af;'>No trips yet.</div>";
+    return;
+  }
+  el.innerHTML = tripHistory.map(function(t, i) {
+    var isActive = (i === activeHistoryIdx);
+    var durStr = t.duration_min >= 60
+      ? Math.floor(t.duration_min/60)+"h "+(t.duration_min%60)+"m"
+      : t.duration_min+" min";
+    return "<div class='history-item"+(isActive?" active":"")+"' onclick='loadTripFromHistory("+i+")'>" +
+      "<div class='hi-top'>" +
+        "<span class='hi-num'>#"+(tripHistory.length-i)+"</span>" +
+        "<span class='hi-mode'>"+t.mode_icon+" "+t.mode+"</span>" +
+      "</div>" +
+      "<div class='hi-meta'>"+durStr+" &nbsp;·&nbsp; "+t.distance_km+" km</div>" +
+      "<div class='hi-time'>"+t.created_at+"</div>" +
+    "</div>";
+  }).join("");
+}
+
+function loadTripFromHistory(idx) {
+  activeHistoryIdx = idx;
+  renderHistoryPanel();
+  var t = tripHistory[idx];
+
+  // Restore start / end markers from stored routing_endpoints
+  var ep = t.data.routing_endpoints;
+  if (ep) {
+    if (ep.start) {
+      var s = ep.start;
+      startPoint = {lat: s.lat, lon: s.lon};
+      if (startMarker) map.removeLayer(startMarker);
+      startMarker = makeMarker(s.lat, s.lon, "Start", "#16a34a");
+      ge("start-out").textContent = s.lat.toFixed(6) + ", " + s.lon.toFixed(6);
+    }
+    if (ep.end) {
+      var e = ep.end;
+      endPoint = {lat: e.lat, lon: e.lon};
+      if (endMarker) map.removeLayer(endMarker);
+      endMarker = makeMarker(e.lat, e.lon, "End", "#dc2626");
+      ge("end-out").textContent = e.lat.toFixed(6) + ", " + e.lon.toFixed(6);
+    }
+  }
+
+  renderRoutes(t.data, true, true);
+
+  // Smooth fly to fit the loaded trip
+  try {
+    var grp = L.featureGroup([startMarker, endMarker].concat(routeLayers).filter(Boolean));
+    map.flyToBounds(grp.getBounds().pad(0.15), {duration: 0.8});
+  } catch(e) {}
+}
+
 // ── Custom labeled marker icons ──────────────────────────────────────────────
 function makeIcon(label, color) {
   var html = "<div style='" +
@@ -361,7 +506,7 @@ function makeIcon(label, color) {
     "border-radius:20px;" +
     "padding:5px 10px 5px 7px;" +
     "display:inline-flex;align-items:center;gap:5px;" +
-    "box-shadow:0 1px 6px rgba(0,0,0,0.28);" +
+    "box-shadow:0 1px 6px rgba(0,0,0,0.28);white-space:nowrap;" +
     "font-family:system-ui,-apple-system,sans-serif;" +
     "font-size:13px;font-weight:700;color:#111;" +
     "white-space:nowrap;" +
@@ -420,6 +565,34 @@ function clearAll() {
 }
 ge("btn-clear").onclick = clearAll;
 
+ge("btn-reverse").onclick = function() {
+  if (!startPoint || !endPoint) {
+    showErr("Missing points", "Set both Start and End before reversing.");
+    return;
+  }
+  // Swap coordinates
+  var tmp = startPoint;
+  startPoint = endPoint;
+  endPoint = tmp;
+
+  // Recreate markers at swapped positions
+  if (startMarker) map.removeLayer(startMarker);
+  if (endMarker)   map.removeLayer(endMarker);
+  startMarker = makeMarker(startPoint.lat, startPoint.lon, "Start", "#16a34a");
+  endMarker   = makeMarker(endPoint.lat,   endPoint.lon,   "End",   "#dc2626");
+
+  // Update coordinate display
+  ge("start-out").textContent = startPoint.lat.toFixed(6) + ", " + startPoint.lon.toFixed(6);
+  ge("end-out").textContent   = endPoint.lat.toFixed(6)   + ", " + endPoint.lon.toFixed(6);
+
+  // Lookup nearest POI for swapped positions
+  fetchPoi(startPoint.lat, startPoint.lon, ge("poi-start-out"));
+  fetchPoi(endPoint.lat,   endPoint.lon,   ge("poi-end-out"));
+
+  // Auto re-route
+  ge("btn-route").click();
+};
+
 function inBounds(p) {
   if (!boundaryBounds || !p) return true;
   return p.lat >= boundaryBounds.min_lat && p.lat <= boundaryBounds.max_lat &&
@@ -428,10 +601,15 @@ function inBounds(p) {
 
 async function fetchPoi(lat, lon, el) {
   try {
-    var r = await fetch(API + "/pois/nearest?lat=" + lat + "&lon=" + lon);
+    var r = await fetch(API + "/pois/nearest?lat=" + lat + "&lon=" + lon + "&snap_radius_m=20");
     if (r.ok) {
       var d = await r.json();
-      el.textContent = d.nearest_poi ? JSON.stringify(d.nearest_poi, null, 2) : "Not found";
+      if (d.nearest_poi && d.within_snap_radius) {
+        el.textContent = JSON.stringify(d.nearest_poi, null, 2);
+      } else {
+        el.textContent = "No POI within 20m (nearest: " + d.distance_m + "m away)";
+        el.style.color = "#9ca3af";
+      }
     } else { el.textContent = "Error"; }
   } catch(e) { el.textContent = "Error"; }
 }
@@ -455,21 +633,21 @@ function addRouteLabel(f, i, visible) {
   var mode = (ge("mode-select") && ge("mode-select").value === "motorcycle") ? "&#127949;" : "&#128663;";
   var html = "<div style='" +
     "background:white;" +
-    "border-radius:8px;" +
-    "padding:6px 10px;" +
+    "border-radius:10px;" +
+    "padding:7px 12px;" +
     "font-family:system-ui,-apple-system,sans-serif;" +
-    "box-shadow:0 1px 6px rgba(0,0,0,0.28);" +
-    "white-space:nowrap;pointer-events:none;" +
-    "display:" + (visible ? "block" : "none") + ";" +
-    "min-width:60px;" +
-    "'>" +
+    "box-shadow:0 2px 8px rgba(0,0,0,0.22);" +
+    "pointer-events:none;" +
+    "display:" + (visible ? "inline-block" : "none") + ";" +
+    "width:auto;" +
+    "' class='route-lbl'>" +
     "<div style='display:flex;align-items:center;gap:5px;'>" +
     "<span style='font-size:14px;'>" + mode + "</span>" +
-    "<span style='font-size:14px;font-weight:700;color:#111;'>" + dur + " min</span>" +
+    "<span style='font-size:14px;font-weight:700;color:#111;'>" + (dur >= 60 ? Math.floor(dur/60) + " hr " + (dur%60) + " min" : dur + " min") + "</span>" +
     "</div>" +
     "<div style='font-size:11px;color:#666;margin-top:1px;padding-left:20px;'>" + dist + " km</div>" +
     "</div>";
-  var icon = L.divIcon({html: html, className: "", iconAnchor: [0, 24]});
+  var icon = L.divIcon({html: html, className: "", iconSize: null, iconAnchor: [0, 0]});
   var lbl = L.marker(pt, {icon: icon, interactive: false, zIndexOffset: 600}).addTo(map);
   return lbl;
 }
@@ -583,11 +761,12 @@ function highlight(idx) {
 
 var lastFeats = [];
 
-function renderRoutes(data) {
+function renderRoutes(data, fromHistory, skipFitBounds) {
   clearRoutes();
   lastMode = ge("mode-select").value;
   ge("used-out").textContent = data.used_routing || "-";
   lastFeats = data.features || [];
+  if (!fromHistory) addTripToHistory(data);
   lastFeats.forEach(function(f, i) {
     var isMain = (i === 0);
     var l = L.geoJSON(f, {
@@ -612,20 +791,36 @@ function renderRoutes(data) {
     var tag = used ? "<span class='badge badge-poi'>POI</span>" : "<span class='badge badge-raw'>raw</span>";
     var instr = (p.instructions || []).map(function(x) { return "<li>" + x + "</li>"; }).join("");
     var dist = ((p.distance_m || 0) / 1000).toFixed(2);
-    return "<div class='route-card' data-i='" + i + "'>" +
-           "<div class='route-title'><span style='display:inline-block;width:10px;height:10px;border-radius:50%;background:" + (COLORS[i] || "#888") + ";margin-right:6px'></span>Route #" + p.rank + tag + "</div>" +
-           "<div style='font-size:13px'><strong>" + dist + " km</strong> &middot; <strong>" + Math.ceil(p.duration_min) + " min</strong> &middot; " + p.mode + "</div>" +
-           "<details><summary style='font-size:12px;cursor:pointer;color:#6b7280;margin-top:4px'>Turn-by-turn</summary>" +
-           "<ol style='font-size:12px;margin:6px 0 0 18px;padding:0'>" + instr + "</ol></details></div>";
+    var durMin = Math.ceil(p.duration_min);
+    var hrStr = durMin >= 60 ? Math.floor(durMin/60) + " hr " + (durMin%60) + " min" : durMin + " min";
+    var isMain = (i === 0);
+    var cardStyle = isMain
+      ? "background:white;border:2px solid #2563eb;border-radius:12px;padding:12px 14px;margin-bottom:10px;cursor:pointer;box-shadow:0 2px 8px rgba(37,99,235,0.15);"
+      : "background:white;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;margin-bottom:10px;cursor:pointer;";
+    return "<div class='route-card' data-i='" + i + "' style='" + cardStyle + "'>" +
+      "<div style='display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;'>" +
+        "<div style='display:flex;align-items:center;gap:8px;'>" +
+          "<span style='display:inline-block;width:12px;height:12px;border-radius:50%;background:" + (COLORS[i]||"#888") + ";flex-shrink:0;'></span>" +
+          "<span style='font-size:18px;font-weight:700;color:#111;'>" + hrStr + "</span>" +
+          (isMain ? "<span style='font-size:11px;background:#dbeafe;color:#1d4ed8;padding:2px 7px;border-radius:10px;font-weight:600;'>Best</span>" : "") +
+        "</div>" +
+        tag +
+      "</div>" +
+      "<div style='font-size:13px;color:#6b7280;margin-left:20px;'>" + dist + " km</div>" +
+      (instr ? "<details><summary style='font-size:12px;cursor:pointer;color:#2563eb;margin-top:6px;margin-left:20px;'>Turn-by-turn</summary>" +
+      "<ol style='font-size:12px;margin:6px 0 0 18px;padding:0;color:#374151;'>" + instr + "</ol></details>" : "") +
+    "</div>";
   }).join("");
   ge("routes-out").innerHTML = cards || "<div style='color:#6b7280'>No routes returned.</div>";
   document.querySelectorAll(".route-card").forEach(function(c) {
     c.addEventListener("click", function() { highlight(+c.dataset.i); });
   });
-  try {
-    var grp = L.featureGroup([startMarker, endMarker].concat(routeLayers).filter(Boolean));
-    map.fitBounds(grp.getBounds().pad(0.15));
-  } catch(e) {}
+  if (!skipFitBounds) {
+    try {
+      var grp = L.featureGroup([startMarker, endMarker].concat(routeLayers).filter(Boolean));
+      map.fitBounds(grp.getBounds().pad(0.15));
+    } catch(e) {}
+  }
   if (routeLayers.length) highlight(0);
 }
 
