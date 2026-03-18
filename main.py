@@ -6,7 +6,6 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
-import networkx as nx
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
@@ -158,8 +157,8 @@ def health(
 
 @health_router.get("/health/graph", response_model=GraphStatsResponse,
                    summary="Graph connectivity stats")
-def graph_stats(svc: RoutingService = Depends(get_service)):
-    stats = svc.graph_stats()
+async def graph_stats(svc: RoutingService = Depends(get_service)):
+    stats = await svc.graph_stats()
     return GraphStatsResponse(**stats)
 
 
@@ -174,7 +173,7 @@ routing_router = APIRouter()
     summary="Compute top-K diverse routes",
     responses={404: {"model": ErrorResponse, "description": "No route found"}},
 )
-def compute_routes(
+async def compute_routes(
     req: RouteRequest,
     svc: RoutingService = Depends(get_service),
 ):
@@ -183,7 +182,7 @@ def compute_routes(
         req.start_lat, req.start_lon, req.end_lat, req.end_lon, req.mode, req.k,
     )
     try:
-        result = svc.compute_routes(
+        result = await svc.compute_routes(
             start_lat=req.start_lat, start_lon=req.start_lon,
             end_lat=req.end_lat,     end_lon=req.end_lon,
             mode=req.mode,
@@ -195,9 +194,6 @@ def compute_routes(
         )
     except ValueError as e:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail=str(e))
-    except nx.NetworkXNoPath:
-        raise HTTPException(status.HTTP_404_NOT_FOUND,
-                            detail="No path exists between the snapped points.")
 
     trip_id = str(uuid.uuid4())
     result.trip_id = trip_id
@@ -206,9 +202,14 @@ def compute_routes(
 
 
 @routing_router.get("/routes/bounds", response_model=BoundsResponse,
-                    summary="Bounding box of road data")
-def roads_bounds(svc: RoutingService = Depends(get_service)):
-    return BoundsResponse(**svc.roads_bounds())
+                    summary="Bounding box of road data (Vietnam)")
+def roads_bounds():
+    # Static bounds for Vietnam — previously derived from road GeoDataFrame
+    return BoundsResponse(
+        crs="EPSG:4326",
+        min_lon=102.14, min_lat=8.18,
+        max_lon=109.46, max_lat=23.39,
+    )
 
 
 # ── Trips router ──────────────────────────────────────────────────────────────

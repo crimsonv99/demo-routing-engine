@@ -5,15 +5,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # ── Data paths ────────────────────────────────────────────────────────
-    roads_path: str = "data/test_road.geojson"
     pois_path: str = "data/VN Sample Data.csv"
-    restrictions_path: str = ""  # optional — leave empty to disable turn restrictions
+
+    # ── Valhalla ──────────────────────────────────────────────────────────
+    valhalla_url: str = "http://localhost:8002"
 
     # ── Routing defaults ─────────────────────────────────────────────────
     default_k: int = 3
     max_k: int = 5
-    route_timeout_s: float = 8.0
-    diversity_threshold: float = 0.20
+    route_timeout_s: float = 15.0
     default_snap_radius_m: float = 20.0
     max_snap_radius_m: float = 200.0
     max_poi_candidates: int = 10

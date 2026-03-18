@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  valhalla:
+    image: ghcr.io/nilsnolde/docker-valhalla/valhalla:latest
+    container_name: valhalla
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./valhalla_data:/custom_files
+    environment:
+      - use_tiles_ignore_pbf=False   # set True after first build to skip rebuild
+      - build_admins=False
+      - build_time_zones=False
+      - build_elevation=False
+      - force_rebuild=False
+    restart: unless-stopped
+
+  api:
+    build: .
+    container_name: routing_api
+    ports:
+      - "8000:8000"
+    env_file: .env
+    depends_on:
+      - valhalla
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
