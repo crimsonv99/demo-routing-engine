@@ -3,15 +3,19 @@ Valhalla HTTP client — replaces routing_engine.py (NetworkX).
 
 Wraps Valhalla's /route endpoint and normalises the response
 into the same RouteResult dataclass the rest of the app uses.
+
+Cost model is tuned to match the original routing_engine.py settings:
+  - SPEED_UTILIZATION_CAR        = 0.50  → top_speed=40, speed_factor=0.50
+  - SPEED_UTILIZATION_MOTORCYCLE = 0.65  → top_speed=52, speed_factor=0.65
+  - CAR_ROAD_PENALTY / MOTORCYCLE_ROAD_PENALTY
+      → mapped to Valhalla use_* and service_penalty options
 """
 from __future__ import annotations
 
+import os
 import httpx
 from dataclasses import dataclass, field
-from typing import Optional
 
-
-import os
 VALHALLA_URL = os.getenv("VALHALLA_URL", "http://localhost:8002")
 
 # Valhalla costing name per travel mode
@@ -24,6 +28,72 @@ MODE_MAP = {
     "auto":       "auto",
     "bicycle":    "bicycle",
     "pedestrian": "pedestrian",
+}
+
+# ── Costing options per mode ─────────────────────────────────────────────────
+#
+# Ported from routing_engine.py:
+#
+#   CAR_ROAD_PENALTY:
+#     motorway=0.5 (very preferred), trunk=0.6, primary=0.8
+#     residential=3.0, service=5.0, living_street=8.0 (heavily avoided)
+#   → use_highways=1.0, use_living_streets=0.1, service_penalty=30, service_factor=0.3
+#
+#   SPEED_UTILIZATION_CAR = 0.50
+#   → top_speed capped at 40 km/h (80 km/h × 0.50) for Vietnam urban traffic
+#
+#   MOTORCYCLE_ROAD_PENALTY:
+#     more flexible — prefers primary/secondary, tolerates residential
+#   → use_highways=0.5, use_living_streets=0.5, service_penalty=10
+#
+#   SPEED_UTILIZATION_MOTORCYCLE = 0.65
+#   → top_speed capped at 52 km/h (80 km/h × 0.65)
+
+COSTING_OPTIONS: dict[str, dict] = {
+    "auto": {
+        # Road type preference (mirrors CAR_ROAD_PENALTY)
+        "use_highways":       1.0,   # strongly prefer motorway/trunk (penalty 0.5–0.6)
+        "use_tolls":          0.5,   # neutral on tolls
+        "use_living_streets": 0.1,   # strongly avoid (penalty 8.0)
+        "use_tracks":         0.0,   # avoid tracks (penalty 15.0)
+        "service_penalty":    30,    # heavy penalty for service roads (penalty 5.0)
+        "service_factor":     0.3,   # slow down on service roads
+    },
+    "motorcycle": {
+        # Road type preference (mirrors MOTORCYCLE_ROAD_PENALTY)
+        "use_highways":       0.5,   # less highway preference than car
+        "use_tolls":          0.5,
+        "use_living_streets": 0.5,   # tolerates living streets (penalty 1.8)
+        "use_tracks":         0.2,   # can use tracks (penalty 3.0)
+        "service_penalty":    10,    # light service road penalty (penalty 1.5)
+        "service_factor":     0.7,
+    },
+    "bicycle": {
+        "use_roads":          0.5,
+        "use_hills":          0.5,
+        "avoid_bad_surfaces": 0.5,
+    },
+    "pedestrian": {
+        "walking_speed":      4.0,   # km/h
+        "use_living_streets": 1.0,
+        "use_tracks":         0.5,
+    },
+}
+
+# ── Duration correction factors ───────────────────────────────────────────────
+#
+# Valhalla estimates duration at near free-flow speed.
+# The old routing_engine applied SPEED_UTILIZATION to reflect Vietnamese traffic:
+#   SPEED_UTILIZATION_CAR        = 0.50  → duration × (1/0.50) = × 2.0
+#   SPEED_UTILIZATION_MOTORCYCLE = 0.65  → duration × (1/0.65) ≈ × 1.54
+#
+# This makes a 4-min Valhalla result → 8 min displayed (matching real conditions).
+
+DURATION_FACTOR: dict[str, float] = {
+    "auto":       1 / 0.50,   # 2.00× — heavy urban congestion (car)
+    "motorcycle": 1 / 0.65,   # 1.54× — motorbike weaves faster through traffic
+    "bicycle":    1 / 0.80,   # 1.25× — minor correction for hills/stops
+    "pedestrian": 1.0,        # walking speed already accurate
 }
 
 
@@ -103,6 +173,7 @@ async def get_routes(
     Raises httpx.HTTPError on connection / HTTP failure.
     """
     costing = MODE_MAP.get(mode, "auto")
+    options = COSTING_OPTIONS.get(costing, {})
 
     body = {
         "locations": [
@@ -116,10 +187,7 @@ async def get_routes(
             "language": "en-US",
         },
         "costing_options": {
-            costing: {
-                "use_highways": 1.0,
-                "use_tolls":    0.5,
-            }
+            costing: options,
         },
     }
 
@@ -132,6 +200,8 @@ async def get_routes(
     # Valhalla returns the best route under "trip" and alternatives under "alternates"
     trips = [data["trip"]] + [alt["trip"] for alt in data.get("alternates", [])]
 
+    factor = DURATION_FACTOR.get(costing, 1.0)
+
     results: list[RouteResult] = []
     for trip in trips:
         summary  = trip["summary"]
@@ -142,7 +212,7 @@ async def get_routes(
         results.append(RouteResult(
             geometry    = {"type": "LineString", "coordinates": coords},
             distance_km = summary["length"],
-            duration_s  = summary["time"],
+            duration_s  = summary["time"] * factor,  # apply Vietnam traffic factor
             instructions= instrs,
             road_names  = road_names,
         ))
