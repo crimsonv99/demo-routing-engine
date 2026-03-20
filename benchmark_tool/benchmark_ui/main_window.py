@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QSplitter,
     QGroupBox, QLineEdit, QListWidget, QStatusBar, QProgressBar,
     QSizePolicy, QAbstractItemView, QMenu, QSpinBox, QTabWidget,
+    QScrollArea,
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore    import QWebEngineSettings
@@ -180,6 +181,76 @@ class FetchWayThread(QThread):
         self.done.emit(self.way_id, json.dumps(latlngs) if latlngs else "")
 
 
+# ── Reroute speed benchmark worker ─────────────────────────────────────────
+class RerouteWorker(QThread):
+    """Runs N reroutes for a fixed start/end with random via-points.
+
+    Each iteration picks a random point along the straight-line start→end,
+    offsets it by 50–400 m in a random direction, then times engine.route()
+    with that via-point.  Emits per-attempt results for live dashboard update.
+    """
+    result_ready = pyqtSignal(float, bool, float)   # elapsed_ms, ok, dist_km
+    progress     = pyqtSignal(int, int)              # done, total
+    finished     = pyqtSignal()
+
+    def __init__(self, engine, start: tuple, end: tuple, mode: str, n: int):
+        super().__init__()
+        self._engine = engine
+        self._start  = start
+        self._end    = end
+        self._mode   = mode
+        self._n      = n
+        self._stop_flag = False
+
+    def stop(self):
+        self._stop_flag = True
+
+    def run(self):
+        import time as _time
+        import math as _math
+        import random as _rand
+
+        s_lat, s_lon = self._start
+        e_lat, e_lon = self._end
+
+        for i in range(self._n):
+            if self._stop_flag:
+                break
+
+            # Random via-point: linear interp along start→end + random offset
+            t        = _rand.uniform(0.15, 0.85)
+            base_lat = s_lat + t * (e_lat - s_lat)
+            base_lon = s_lon + t * (e_lon - s_lon)
+
+            angle  = _rand.uniform(0, 2 * _math.pi)
+            dist_m = _rand.uniform(50, 400)
+            dlat   = dist_m / 111_320 * _math.cos(angle)
+            dlon   = dist_m / 111_320 * _math.sin(angle) / max(
+                        _math.cos(_math.radians(base_lat)), 0.001)
+
+            via = (base_lat + dlat, base_lon + dlon)
+
+            t0 = _time.monotonic()
+            try:
+                result     = self._engine.route(
+                    s_lat, s_lon, e_lat, e_lon,
+                    mode=self._mode,
+                    via_points=[via],
+                )
+                elapsed_ms = (_time.monotonic() - t0) * 1000
+                ok         = result.ok
+                dist_km    = result.distance_km if result.ok else 0.0
+            except Exception:
+                elapsed_ms = (_time.monotonic() - t0) * 1000
+                ok         = False
+                dist_km    = 0.0
+
+            self.result_ready.emit(elapsed_ms, ok, dist_km)
+            self.progress.emit(i + 1, self._n)
+
+        self.finished.emit()
+
+
 class FetchNodeThread(QThread):
     """Fetches coordinates for a list of OSM node IDs from Overpass."""
     done = pyqtSignal(str, str)   # (restriction_id, json_node_coords_or_empty)
@@ -325,6 +396,15 @@ class MainWindow(QMainWindow):
         # Failed trips log for investigation
         self._failed_trips: list[dict] = []
 
+        # Reroute speed test state
+        self._reroute_worker:  QThread | None = None
+        self._reroute_stats: dict = {
+            "engine": "", "n": 0, "ok": 0,
+            "total_ms": 0.0, "min_ms": float("inf"),
+            "max_ms": 0.0,   "total_km": 0.0,
+        }
+        self._reroute_history: list[dict] = []
+
         # Restriction records (RC / TR), loaded from disk + added live
         self._restrictions: list[dict] = []
         self._fetch_threads: list[QThread] = []   # keep refs alive
@@ -342,9 +422,22 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Left control panel ─────────────────────────────────────────
+        # ── Left control panel (scrollable) ────────────────────────────
+        _sidebar_scroll = QScrollArea()
+        _sidebar_scroll.setFixedWidth(265)
+        _sidebar_scroll.setWidgetResizable(True)
+        _sidebar_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        _sidebar_scroll.setStyleSheet(
+            "QScrollArea{background:#1e1e2e;border:none;}"
+            "QScrollBar:vertical{background:#1e1e2e;width:8px;margin:0px;}"
+            "QScrollBar::handle:vertical{background:#45475a;border-radius:4px;"
+            "min-height:20px;}"
+            "QScrollBar::handle:vertical:hover{background:#585b70;}"
+            "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical"
+            "{height:0px;}"
+        )
         panel = QWidget()
-        panel.setFixedWidth(250)
         panel.setStyleSheet("background:#1e1e2e; color:#cdd6f4;")
         playout = QVBoxLayout(panel)
         playout.setContentsMargins(10, 10, 10, 10)
@@ -600,6 +693,71 @@ class MainWindow(QMainWindow):
         g_rand.layout().addWidget(self._batch_progress)
         playout.addWidget(g_rand)
 
+        # ── Reroute Speed Test ─────────────────────────────────────────
+        g_reroute = self._group("Reroute Speed Test")
+
+        rr_eng_row = QHBoxLayout()
+        rr_eng_lbl = QLabel("Engine:")
+        rr_eng_lbl.setStyleSheet("color:#a6adc8; font-size:10px;")
+        self._reroute_eng_combo = QComboBox()
+        for eng in ENGINE_LIST:
+            self._reroute_eng_combo.addItem(eng.NAME)
+        self._reroute_eng_combo.setStyleSheet(self._combo_style())
+        rr_eng_row.addWidget(rr_eng_lbl)
+        rr_eng_row.addWidget(self._reroute_eng_combo, 1)
+        g_reroute.layout().addLayout(rr_eng_row)
+
+        rr_run_row = QHBoxLayout()
+        self._reroute_spin = QSpinBox()
+        self._reroute_spin.setRange(1, 999)
+        self._reroute_spin.setValue(20)
+        self._reroute_spin.setFixedWidth(58)
+        self._reroute_spin.setStyleSheet(
+            "QSpinBox{background:#313244;color:#cdd6f4;border:1px solid #45475a;"
+            "border-radius:4px;padding:2px 4px;font-size:10px;}"
+            "QSpinBox::up-button,QSpinBox::down-button{width:14px;}"
+        )
+        self._btn_reroute_run = QPushButton("▶ Run")
+        self._btn_reroute_run.setFixedHeight(24)
+        self._btn_reroute_run.setEnabled(False)
+        self._btn_reroute_run.setStyleSheet(
+            "QPushButton{background:#a6e3a1;color:#1e1e2e;border-radius:4px;"
+            "font-weight:700;font-size:10px;padding:2px 6px;}"
+            "QPushButton:hover{background:#b8f0b0;}"
+            "QPushButton:disabled{background:#45475a;color:#6c7086;}"
+        )
+        self._btn_reroute_run.clicked.connect(self._start_reroute)
+
+        self._btn_reroute_stop = QPushButton("■ Stop")
+        self._btn_reroute_stop.setFixedHeight(24)
+        self._btn_reroute_stop.setEnabled(False)
+        self._btn_reroute_stop.setStyleSheet(
+            "QPushButton{background:#f38ba8;color:#1e1e2e;border-radius:4px;"
+            "font-weight:700;font-size:10px;padding:2px 6px;}"
+            "QPushButton:hover{background:#ff9aac;}"
+            "QPushButton:disabled{background:#45475a;color:#6c7086;}"
+        )
+        self._btn_reroute_stop.clicked.connect(self._stop_reroute)
+        rr_run_row.addWidget(self._reroute_spin)
+        rr_run_row.addWidget(self._btn_reroute_run)
+        rr_run_row.addWidget(self._btn_reroute_stop)
+        g_reroute.layout().addLayout(rr_run_row)
+
+        self._reroute_progress = QProgressBar()
+        self._reroute_progress.setRange(0, 100)
+        self._reroute_progress.setVisible(False)
+        self._reroute_progress.setStyleSheet(
+            "QProgressBar{background:#313244;border-radius:4px;height:6px;"
+            "text-align:center;}"
+            "QProgressBar::chunk{background:#a6e3a1;border-radius:4px;}"
+        )
+        self._reroute_status_lbl = QLabel("Route first to enable")
+        self._reroute_status_lbl.setStyleSheet("color:#a6adc8; font-size:10px;")
+        self._reroute_status_lbl.setWordWrap(True)
+        g_reroute.layout().addWidget(self._reroute_progress)
+        g_reroute.layout().addWidget(self._reroute_status_lbl)
+        playout.addWidget(g_reroute)
+
         # ── NetworkX load progress ─────────────────────────────────────
         self._nx_progress = QProgressBar()
         self._nx_progress.setRange(0, 0)
@@ -611,6 +769,8 @@ class MainWindow(QMainWindow):
         playout.addWidget(self._nx_progress)
 
         playout.addStretch()
+
+        _sidebar_scroll.setWidget(panel)
 
         # ── Right side: tab widget (Map | Dashboard) ───────────────────
         right   = QWidget()
@@ -783,7 +943,7 @@ class MainWindow(QMainWindow):
 
         rlayout.addWidget(self._tabs)
 
-        root.addWidget(panel)
+        root.addWidget(_sidebar_scroll)
         root.addWidget(right, 1)
 
         # Status bar
@@ -807,7 +967,7 @@ class MainWindow(QMainWindow):
         title_lbl.setStyleSheet("color:#cba6f7;")
         hdr_row.addWidget(title_lbl)
         hdr_row.addStretch()
-        btn_clear_stats = QPushButton("🗑 Clear Stats")
+        btn_clear_stats = QPushButton("🗑 Clear All")
         btn_clear_stats.setFixedHeight(26)
         btn_clear_stats.setStyleSheet(
             "QPushButton{background:#313244;color:#f38ba8;border-radius:4px;"
@@ -824,20 +984,29 @@ class MainWindow(QMainWindow):
         self._dash_summary_lbl.setStyleSheet("color:#a6adc8; font-size:11px;")
         root.addWidget(self._dash_summary_lbl)
 
-        # ── Main vertical splitter: top (stats+chart) | bottom (failures) ──
-        v_split = QSplitter(Qt.Orientation.Vertical)
-        v_split.setStyleSheet(
-            "QSplitter::handle{background:#313244; height:3px;}"
+        # ── Sub-tab widget ───────────────────────────────────────────
+        _sub_tab_style = (
+            "QTabWidget::pane{border:none;}"
+            "QTabBar::tab{background:#313244;color:#a6adc8;padding:5px 14px;"
+            "border-radius:4px 4px 0 0;margin-right:2px;font-size:10px;}"
+            "QTabBar::tab:selected{background:#1e1e2e;color:#cba6f7;font-weight:700;}"
+            "QTabBar::tab:hover{background:#45475a;}"
         )
+        sub_tabs = QTabWidget()
+        sub_tabs.setStyleSheet(_sub_tab_style)
 
-        # ── Top: stats table (left) + bar chart (right) side by side ──
-        top_widget = QWidget()
-        top_widget.setStyleSheet("background:transparent;")
-        top_layout = QHBoxLayout(top_widget)
+        # ── Sub-tab 1: Trip Benchmark ────────────────────────────────
+        bench_tab = QWidget()
+        bench_tab.setStyleSheet("background:transparent;")
+        bench_layout = QVBoxLayout(bench_tab)
+        bench_layout.setContentsMargins(0, 8, 0, 0)
+        bench_layout.setSpacing(8)
+
+        # Stats table (left) + bar chart (right)
+        top_layout = QHBoxLayout()
         top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.setSpacing(12)
 
-        # Stats table
         self._dash_table = QTableWidget(0, 7)
         self._dash_table.setHorizontalHeaderLabels([
             "Engine", "Trips", "Success %", "Avg ms", "Min ms", "Max ms", "Avg km",
@@ -861,11 +1030,8 @@ class MainWindow(QMainWindow):
         self._dash_table.verticalHeader().setVisible(False)
         top_layout.addWidget(self._dash_table, 3)
 
-        # Bar chart panel (right side)
         chart_panel = QWidget()
-        chart_panel.setStyleSheet(
-            "background:#181825; border-radius:6px;"
-        )
+        chart_panel.setStyleSheet("background:#181825; border-radius:6px;")
         chart_panel_layout = QVBoxLayout(chart_panel)
         chart_panel_layout.setContentsMargins(10, 10, 10, 10)
         chart_panel_layout.setSpacing(4)
@@ -874,7 +1040,6 @@ class MainWindow(QMainWindow):
         chart_lbl.setStyleSheet("color:#a6adc8; font-size:10px;")
         chart_panel_layout.addWidget(chart_lbl)
 
-        from PyQt6.QtWidgets import QScrollArea
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setStyleSheet(
@@ -888,9 +1053,125 @@ class MainWindow(QMainWindow):
         chart_panel_layout.addWidget(scroll, 1)
         top_layout.addWidget(chart_panel, 4)
 
-        v_split.addWidget(top_widget)
+        bench_layout.addLayout(top_layout, 1)
+        sub_tabs.addTab(bench_tab, "📊 Trip Benchmark")
 
-        # ── Bottom: failed trips ──────────────────────────────────────
+        # ── Sub-tab 2: Reroute Speed ─────────────────────────────────
+        reroute_tab = QWidget()
+        reroute_tab.setStyleSheet("background:transparent;")
+        reroute_layout = QVBoxLayout(reroute_tab)
+        reroute_layout.setContentsMargins(0, 8, 0, 0)
+        reroute_layout.setSpacing(8)
+
+        # Reroute header row
+        rr_hdr_row = QHBoxLayout()
+        rr_title_lbl = QLabel("🔄 Reroute Response Time")
+        rr_title_lbl.setStyleSheet("color:#a6e3a1; font-weight:700; font-size:11px;")
+        rr_hdr_row.addWidget(rr_title_lbl)
+        rr_hdr_row.addStretch()
+        btn_rr_clear = QPushButton("🗑 Clear")
+        btn_rr_clear.setFixedHeight(24)
+        btn_rr_clear.setStyleSheet(
+            "QPushButton{background:#313244;color:#f38ba8;border-radius:4px;"
+            "padding:2px 8px;font-size:10px;}"
+            "QPushButton:hover{background:#45475a;}"
+        )
+        btn_rr_clear.clicked.connect(self._clear_reroute_stats)
+        rr_hdr_row.addWidget(btn_rr_clear)
+        reroute_layout.addLayout(rr_hdr_row)
+
+        # Top area: stats table (left) + bar chart (right)
+        rr_top = QHBoxLayout()
+        rr_top.setContentsMargins(0, 0, 0, 0)
+        rr_top.setSpacing(12)
+
+        self._rr_table = QTableWidget(0, 6)
+        self._rr_table.setHorizontalHeaderLabels([
+            "Engine", "Attempts", "Success%", "Avg ms", "Min ms", "Max ms",
+        ])
+        rr_hh = self._rr_table.horizontalHeader()
+        rr_hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col in range(1, 6):
+            rr_hh.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+        for col, w_px in enumerate([68, 75, 70, 65, 65], start=1):
+            self._rr_table.setColumnWidth(col, w_px)
+        self._rr_table.setStyleSheet(
+            "QTableWidget{background:#181825;color:#cdd6f4;"
+            "gridline-color:#313244;border:none;border-radius:6px;}"
+            "QHeaderView::section{background:#313244;color:#a6adc8;"
+            "border:none;padding:5px;font-size:10px;}"
+            "QTableWidget::item{padding:5px;}"
+            "QTableWidget::item:selected{background:#313244;}"
+        )
+        self._rr_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self._rr_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._rr_table.verticalHeader().setVisible(False)
+        rr_top.addWidget(self._rr_table, 3)
+
+        rr_chart_panel = QWidget()
+        rr_chart_panel.setStyleSheet("background:#181825; border-radius:6px;")
+        rr_chart_layout = QVBoxLayout(rr_chart_panel)
+        rr_chart_layout.setContentsMargins(10, 10, 10, 10)
+        rr_chart_layout.setSpacing(4)
+
+        rr_chart_lbl = QLabel("Response time  (Avg · Min · Max) — lower is faster")
+        rr_chart_lbl.setStyleSheet("color:#a6adc8; font-size:10px;")
+        rr_chart_layout.addWidget(rr_chart_lbl)
+
+        rr_scroll = QScrollArea()
+        rr_scroll.setWidgetResizable(True)
+        rr_scroll.setStyleSheet(
+            "QScrollArea{border:none; background:transparent;}"
+            "QScrollBar:vertical{width:6px;background:#181825;}"
+            "QScrollBar::handle:vertical{background:#45475a;border-radius:3px;}"
+        )
+        self._rr_bar_chart = HorizontalBarChart()
+        self._rr_bar_chart.setStyleSheet("background:transparent;")
+        rr_scroll.setWidget(self._rr_bar_chart)
+        rr_chart_layout.addWidget(rr_scroll, 1)
+        rr_top.addWidget(rr_chart_panel, 4)
+
+        reroute_layout.addLayout(rr_top)
+
+        # History table
+        self._rr_history_table = QTableWidget(0, 5)
+        self._rr_history_table.setHorizontalHeaderLabels([
+            "Time", "Engine", "Response (ms)", "OK", "Dist (km)",
+        ])
+        rr_hhist = self._rr_history_table.horizontalHeader()
+        rr_hhist.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        rr_hhist.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        rr_hhist.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        rr_hhist.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        rr_hhist.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        self._rr_history_table.setColumnWidth(0, 75)
+        self._rr_history_table.setColumnWidth(2, 100)
+        self._rr_history_table.setColumnWidth(3, 40)
+        self._rr_history_table.setColumnWidth(4, 80)
+        self._rr_history_table.setStyleSheet(
+            "QTableWidget{background:#181825;color:#cdd6f4;"
+            "gridline-color:#313244;border:none;border-radius:6px;}"
+            "QHeaderView::section{background:#313244;color:#a6adc8;"
+            "border:none;padding:4px;font-size:10px;}"
+            "QTableWidget::item{padding:3px;}"
+            "QTableWidget::item:selected{background:#45475a;}"
+        )
+        self._rr_history_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._rr_history_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._rr_history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._rr_history_table.verticalHeader().setVisible(False)
+        reroute_layout.addWidget(self._rr_history_table, 1)
+
+        sub_tabs.addTab(reroute_tab, "🔄 Reroute Speed")
+
+        # ── Vertical splitter: sub_tabs (top) | failed trips (bottom) ─
+        v_split = QSplitter(Qt.Orientation.Vertical)
+        v_split.setStyleSheet(
+            "QSplitter::handle{background:#313244; height:3px;}"
+        )
+
+        v_split.addWidget(sub_tabs)
+
         fail_widget = QWidget()
         fail_widget.setStyleSheet("background:transparent;")
         fail_layout = QVBoxLayout(fail_widget)
@@ -959,7 +1240,7 @@ class MainWindow(QMainWindow):
         fail_layout.addWidget(self._fail_table, 1)
 
         v_split.addWidget(fail_widget)
-        v_split.setSizes([420, 200])
+        v_split.setSizes([480, 200])
 
         root.addWidget(v_split, 1)
         return w
@@ -1413,6 +1694,163 @@ class MainWindow(QMainWindow):
         self._update_dashboard()
         self._status.showMessage("Benchmark stats cleared")
 
+    # ── Reroute speed test ─────────────────────────────────────────────
+    def _enable_reroute(self):
+        """Call after a route is successfully computed."""
+        self._btn_reroute_run.setEnabled(True)
+        self._reroute_status_lbl.setText("Ready — click Run to start reroute test")
+
+    def _start_reroute(self):
+        if not self._start or not self._end:
+            self._status.showMessage("Set start and end first")
+            return
+
+        eng_name = self._reroute_eng_combo.currentText()
+        engine   = next((e for e in ENGINE_LIST if e.NAME == eng_name), None)
+        if engine is None:
+            return
+
+        n    = self._reroute_spin.value()
+        mode = self._mode_combo.currentText()
+
+        # Reset stats for this run (keep history cumulative)
+        self._reroute_stats = {
+            "engine": eng_name, "n": 0, "ok": 0,
+            "total_ms": 0.0, "min_ms": float("inf"),
+            "max_ms": 0.0,   "total_km": 0.0,
+        }
+
+        self._reroute_worker = RerouteWorker(engine, self._start, self._end, mode, n)
+        self._reroute_worker.result_ready.connect(self._on_reroute_result)
+        self._reroute_worker.progress.connect(self._on_reroute_progress)
+        self._reroute_worker.finished.connect(self._on_reroute_finished)
+        self._reroute_worker.start()
+
+        self._btn_reroute_run.setEnabled(False)
+        self._btn_reroute_stop.setEnabled(True)
+        self._reroute_progress.setVisible(True)
+        self._reroute_progress.setValue(0)
+        self._reroute_status_lbl.setText(f"Running 0/{n} …")
+        self._status.showMessage(f"Reroute test: {n} attempts on {eng_name}")
+
+    def _stop_reroute(self):
+        if self._reroute_worker:
+            self._reroute_worker.stop()
+
+    def _on_reroute_result(self, elapsed_ms: float, ok: bool, dist_km: float):
+        s = self._reroute_stats
+        s["n"] += 1
+        if ok:
+            s["ok"]       += 1
+            s["total_ms"] += elapsed_ms
+            s["min_ms"]    = min(s["min_ms"], elapsed_ms)
+            s["max_ms"]    = max(s["max_ms"], elapsed_ms)
+            s["total_km"] += dist_km
+        self._reroute_history.append({
+            "ts":  datetime.now().strftime("%H:%M:%S"),
+            "ms":  elapsed_ms,
+            "ok":  ok,
+            "km":  dist_km,
+            "eng": s["engine"],
+        })
+        self._update_reroute_dashboard()
+
+    def _on_reroute_progress(self, done: int, total: int):
+        self._reroute_progress.setValue(int(done / total * 100))
+        self._reroute_status_lbl.setText(f"Running {done}/{total} …")
+
+    def _on_reroute_finished(self):
+        self._btn_reroute_run.setEnabled(True)
+        self._btn_reroute_stop.setEnabled(False)
+        self._reroute_progress.setVisible(False)
+        s = self._reroute_stats
+        if s["ok"] > 0:
+            avg = s["total_ms"] / s["ok"]
+            self._reroute_status_lbl.setText(
+                f"Done ✓  {s['ok']}/{s['n']} OK  avg {avg:.0f} ms"
+            )
+        else:
+            self._reroute_status_lbl.setText(f"Done  0/{s['n']} OK")
+        self._update_reroute_dashboard()
+        self._tabs.setCurrentIndex(1)   # switch to Dashboard
+
+    def _update_reroute_dashboard(self):
+        """Refresh reroute stats table, bar chart, and history table."""
+        s = self._reroute_stats
+        if not s["engine"]:
+            return
+
+        # ── Stats table ───────────────────────────────────────────────
+        t = self._rr_table
+        t.setRowCount(0)
+
+        ok    = s["ok"]
+        n     = s["n"]
+        avg   = s["total_ms"] / ok if ok else 0
+        pct   = int(100 * ok / n)  if n  else 0
+
+        eng_obj  = next((e for e in ENGINE_LIST if e.NAME == s["engine"]), None)
+        color    = eng_obj.COLOR if eng_obj else "#cdd6f4"
+
+        def rc(text, clr=None):
+            item = QTableWidgetItem(text)
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if clr:
+                item.setForeground(QColor(clr))
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            return item
+
+        t.insertRow(0)
+        t.setRowHeight(0, 30)
+        t.setItem(0, 0, rc(s["engine"], color))
+        t.setItem(0, 1, rc(str(n)))
+        t.setItem(0, 2, rc(f"{pct}%",
+            "#a6e3a1" if pct == 100 else ("#fab387" if pct >= 80 else "#f38ba8")))
+        t.setItem(0, 3, rc(f"{avg:.0f}", "#89dceb"))
+        t.setItem(0, 4, rc(f"{s['min_ms']:.0f}" if ok else "—", "#a6e3a1"))
+        t.setItem(0, 5, rc(f"{s['max_ms']:.0f}" if ok else "—", "#f38ba8"))
+
+        # ── Bar chart ─────────────────────────────────────────────────
+        if ok:
+            self._rr_bar_chart.set_data(
+                [(s["engine"],
+                  {"Avg": avg, "Min": s["min_ms"], "Max": s["max_ms"]},
+                  color)],
+                metrics=["Avg", "Min", "Max"],
+                unit="ms",
+            )
+
+        # ── History table ─────────────────────────────────────────────
+        ht = self._rr_history_table
+        ht.setRowCount(0)
+        for entry in reversed(self._reroute_history[-200:]):   # show last 200
+            row = ht.rowCount()
+            ht.insertRow(row)
+            ht.setRowHeight(row, 22)
+            ms_color = (
+                "#a6e3a1" if entry["ms"] < 100 else
+                "#fab387" if entry["ms"] < 500 else "#f38ba8"
+            )
+            ht.setItem(row, 0, rc(entry["ts"], "#6c7086"))
+            ht.setItem(row, 1, rc(entry["eng"],
+                eng_obj.COLOR if eng_obj else "#cdd6f4"))
+            ht.setItem(row, 2, rc(f"{entry['ms']:.0f} ms", ms_color))
+            ht.setItem(row, 3, rc("✓" if entry["ok"] else "✗",
+                "#a6e3a1" if entry["ok"] else "#f38ba8"))
+            ht.setItem(row, 4, rc(f"{entry['km']:.2f} km" if entry["ok"] else "—"))
+
+    def _clear_reroute_stats(self):
+        self._reroute_stats = {
+            "engine": "", "n": 0, "ok": 0,
+            "total_ms": 0.0, "min_ms": float("inf"),
+            "max_ms": 0.0,   "total_km": 0.0,
+        }
+        self._reroute_history.clear()
+        self._update_reroute_dashboard()
+        self._rr_table.setRowCount(0)
+        self._rr_bar_chart.set_data([], [])
+        self._rr_history_table.setRowCount(0)
+
     # ── Routing ────────────────────────────────────────────────────────
     def _do_route(self):
         if not self._start or not self._end:
@@ -1501,6 +1939,7 @@ class MainWindow(QMainWindow):
 
     def _on_all_done(self):
         self._update_dashboard()
+        self._enable_reroute()
         self._btn_route.setEnabled(True)
         active = [r for r in self._restrictions if self._is_restriction_active(r)]
         n_r = len(active)
@@ -1553,6 +1992,8 @@ class MainWindow(QMainWindow):
         self._bridge.set_click_mode(None)
         self._btn_start.setStyleSheet("")
         self._btn_end.setStyleSheet("")
+        self._btn_reroute_run.setEnabled(False)
+        self._reroute_status_lbl.setText("Route first to enable")
         # Re-draw restriction overlays from stored geometry (no Overpass needed)
         for rec in self._restrictions:
             self._draw_restriction_on_map(rec)
