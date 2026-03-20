@@ -13,6 +13,7 @@ class RouteResult:
     instructions: list[str] = field(default_factory=list)
     osm_way_ids:  list[int] = field(default_factory=list)
     error:        Optional[str] = None
+    elapsed_ms:   float = 0.0         # wall-clock engine response time
 
     @property
     def duration_min(self) -> float:

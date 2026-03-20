@@ -1,4 +1,5 @@
 from __future__ import annotations
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -59,19 +60,21 @@ class RouteWorker(QThread):
             self.all_done.emit()
             return
 
+        def _timed_route(eng: BaseEngine) -> RouteResult:
+            t0 = time.perf_counter()
+            result = eng.route(
+                self.start_lat, self.start_lon,
+                self.end_lat,   self.end_lon,
+                self.mode,
+                self.restrictions or None,
+                self.buffer_deg,
+                self.via_points or None,
+            )
+            result.elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            return result
+
         with ThreadPoolExecutor(max_workers=len(available)) as pool:
-            futures = {
-                pool.submit(
-                    e.route,
-                    self.start_lat, self.start_lon,
-                    self.end_lat,   self.end_lon,
-                    self.mode,
-                    self.restrictions or None,
-                    self.buffer_deg,
-                    self.via_points or None,
-                ): e
-                for e in available
-            }
+            futures = {pool.submit(_timed_route, e): e for e in available}
             for future in as_completed(futures):
                 try:
                     result: RouteResult = future.result()
