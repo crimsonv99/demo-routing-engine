@@ -43,26 +43,46 @@ def _get_factor(mode: str, multiplier_override: float | None = None) -> float:
     return _BASE_FACTOR.get(mode, 2.50) * mult
 
 
-def _ferry_time_ms(path: dict) -> float:
-    """Return the milliseconds that belong to ferry segments in a GH path.
+def _ferry_correction(path: dict) -> tuple[float, float]:
+    """Return (gh_ferry_ms, corrected_ferry_ms).
 
-    GH has already been told to route ferry at _FERRY_SPEED_KPH, so the
-    ferry portion's time in path["time"] is dist_km / _FERRY_SPEED_KPH * 3600s.
-    We measure ferry distance from the road_environment detail intervals.
+    gh_ferry_ms       — time GH computed for ferry edges using OSM duration
+                        tags (typically ~4 km/h, far too slow).
+    corrected_ferry_ms — time at _FERRY_SPEED_KPH (10 km/h).
+
+    Strategy:
+      1. Find ferry coordinate intervals from road_environment detail.
+      2. Build a per-point speed map from average_speed detail.
+      3. For each ferry segment, compute haversine distance.
+      4. gh_time    = dist / gh_speed;   corrected_time = dist / _FERRY_SPEED_KPH
     """
     coords = path["points"]["coordinates"]   # [[lon, lat], ...]
-    ferry_dist_m = 0.0
-    for interval in path.get("details", {}).get("road_environment", []):
-        from_idx, to_idx, env = interval
-        if env != "FERRY":
+    details = path.get("details", {})
+
+    # Build point-index → average_speed (km/h) lookup
+    speed_at: dict[int, float] = {}
+    for from_i, to_i, spd in details.get("average_speed", []):
+        for i in range(from_i, to_i):
+            speed_at[i] = float(spd)
+
+    gh_ms   = 0.0
+    corr_ms = 0.0
+
+    for from_idx, to_idx, env in details.get("road_environment", []):
+        if env != "ferry":          # GH returns lowercase "ferry"
             continue
         for i in range(from_idx, min(to_idx, len(coords) - 1)):
             a, b = coords[i], coords[i + 1]
             mid_lat = math.radians((a[1] + b[1]) / 2)
             dx = (b[0] - a[0]) * math.cos(mid_lat) * 111_320
             dy = (b[1] - a[1]) * 110_540
-            ferry_dist_m += math.sqrt(dx * dx + dy * dy)
-    return (ferry_dist_m / 1000.0) / _FERRY_SPEED_KPH * 3_600_000   # ms
+            seg_km = math.sqrt(dx * dx + dy * dy) / 1000.0
+
+            gh_speed   = speed_at.get(i, 4.0)   # fallback 4 km/h
+            gh_ms   += seg_km / gh_speed          * 3_600_000
+            corr_ms += seg_km / _FERRY_SPEED_KPH * 3_600_000
+
+    return gh_ms, corr_ms
 
 
 class GraphHopperEngine(BaseEngine):
@@ -95,19 +115,10 @@ class GraphHopperEngine(BaseEngine):
             "points":          points,
             "profile":         profile,
             "points_encoded":  False,
-            "details":         ["osm_way_id", "road_environment"],
-            # Force ferry edges to exactly _FERRY_SPEED_KPH km/h.
-            # multiply_by:1000 boosts any OSM-derived speed to near-max;
-            # limit_to:_FERRY_SPEED_KPH then caps it precisely.
-            # Together they SET (not just cap) the speed for ferry edges.
-            "custom_model": {
-                "speed": [
-                    {"if": "road_environment == FERRY",
-                     "multiply_by": 1000},
-                    {"if": "road_environment == FERRY",
-                     "limit_to": _FERRY_SPEED_KPH},
-                ]
-            },
+            # road_environment → detect ferry segments post-route
+            # average_speed    → know the GH-calculated speed so we can
+            #                     compute the exact GH ferry time to subtract
+            "details":         ["osm_way_id", "road_environment", "average_speed"],
         }
 
         # Restriction enforcement via blocked_points (hard avoidance)
@@ -184,15 +195,16 @@ class GraphHopperEngine(BaseEngine):
                     print(f"[GraphHopper] ⚠ Route still uses restricted way(s): {leaked}")
 
             # ── Ferry speed correction ─────────────────────────────────
-            # custom_model already forced ferry edges to _FERRY_SPEED_KPH.
-            # Traffic multiplier must NOT apply to ferry (fixed schedule).
-            f_ms = _ferry_time_ms(path)
-            if f_ms > 0:
-                non_ferry_ms = path["time"] - f_ms
-                duration_s   = (non_ferry_ms / 1000.0) * factor + (f_ms / 1000.0)
+            # GH uses OSM duration tags for ferry speed (~4 km/h, too slow).
+            # We post-correct ferry segments to _FERRY_SPEED_KPH.
+            # Traffic multiplier is NOT applied to ferry (fixed schedule).
+            gh_ferry_ms, corr_ferry_ms = _ferry_correction(path)
+            if gh_ferry_ms > 0:
+                non_ferry_ms = path["time"] - gh_ferry_ms
+                duration_s   = (non_ferry_ms / 1000.0) * factor + (corr_ferry_ms / 1000.0)
                 print(f"[GraphHopper] ⛴ Ferry: "
-                      f"{f_ms/1000/60:.1f} min @ {_FERRY_SPEED_KPH} km/h "
-                      f"(traffic factor not applied to ferry portion)")
+                      f"{corr_ferry_ms/1000/60:.1f} min @ {_FERRY_SPEED_KPH} km/h "
+                      f"(GH had {gh_ferry_ms/1000/60:.1f} min from OSM duration)")
             else:
                 duration_s = (path["time"] / 1000.0) * factor
 
