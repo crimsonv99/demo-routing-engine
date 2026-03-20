@@ -61,6 +61,8 @@ class RoutingService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._trips: Dict[str, TripRecord] = {}
+        self._last_osm_way_ids: List[int] = []
+        self._last_intersection_coords: List[List[float]] = []
         self._load_pois()
         logger.info("RoutingService ready | pois=%d | backend=valhalla", len(self.pois))
 
@@ -227,6 +229,11 @@ class RoutingService:
 
         features = self._build_features(routes, mode, used)
 
+        # Carry OSM IDs from best (first) Valhalla result for trip recording
+        best = routes[0]
+        self._last_osm_way_ids         = best.osm_way_ids
+        self._last_intersection_coords = best.intersection_coords
+
         return RouteResponse(
             type="FeatureCollection",
             features=features,
@@ -236,6 +243,8 @@ class RoutingService:
             },
             poi_snap=snap_info,
             used_routing=used,
+            osm_way_ids=list(self._last_osm_way_ids),
+            intersection_coords=list(self._last_intersection_coords),
         )
 
     def _build_features(
@@ -285,6 +294,8 @@ class RoutingService:
             request=req_dict,
             planned_coords=planned_coords,
             response=response,
+            osm_way_ids=list(self._last_osm_way_ids),
+            intersection_coords=list(self._last_intersection_coords),
         )
         self._trips[trip_id] = record
         logger.info("trip stored | id=%s routes=%d", trip_id, len(response.features))

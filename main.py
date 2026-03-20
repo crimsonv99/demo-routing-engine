@@ -336,6 +336,12 @@ _MAP_HTML_TEMPLATE = """<!doctype html>
     .traffic-label{font-size:12px;color:#555;flex:1;}
     .traffic-result{font-size:12px;font-weight:700;color:#2563eb;margin-top:6px;}
     .traffic-hint{font-size:11px;color:#9ca3af;margin-top:3px;}
+    .osm-panel{margin-top:2px;}
+    .osm-id-grid{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px;max-height:120px;overflow-y:auto;}
+    .osm-id-chip{font-size:11px;background:#f3f0ff;color:#5b21b6;border:1px solid #ddd6fe;border-radius:5px;padding:2px 6px;cursor:pointer;font-family:monospace;}
+    .osm-id-chip:hover{background:#ede9fe;}
+    .osm-copy-btn{font-size:11px;padding:3px 8px;margin-left:6px;background:#7c3aed;color:white;border:none;border-radius:5px;cursor:pointer;vertical-align:middle;}
+    .osm-copy-btn:hover{background:#6d28d9;}
   </style>
 </head>
 <body>
@@ -399,6 +405,15 @@ _MAP_HTML_TEMPLATE = """<!doctype html>
       <div id="traffic-result" class="traffic-result"></div>
       <div class="traffic-hint">travel_speed = maxspeed × util_ratio × traffic_ratio</div>
     </div>
+    <div class="section osm-panel" id="osm-section" style="display:none;">
+      <div class="label" style="display:flex;align-items:center;gap:6px;">
+        &#128739; OSM Way IDs
+        <span id="osm-way-count" style="font-size:11px;color:#7c3aed;background:#ede9fe;border-radius:6px;padding:1px 6px;font-weight:600;"></span>
+        <button class="osm-copy-btn" onclick="copyOsmIds()" title="Copy all way IDs">&#8266; Copy all</button>
+      </div>
+      <div id="osm-way-grid" class="osm-id-grid"></div>
+      <div id="osm-intersect-info" style="font-size:11px;color:#6b7280;margin-top:6px;"></div>
+    </div>
   </div>
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -439,6 +454,8 @@ function addTripToHistory(data) {
     mode_icon: modeIcon,
     duration_min: durMin,
     distance_km: distKm,
+    osm_way_ids: data.osm_way_ids || [],
+    intersection_coords: data.intersection_coords || [],
     data: data,
   });
   activeHistoryIdx = 0;
@@ -456,10 +473,14 @@ function renderHistoryPanel() {
     var durStr = t.duration_min >= 60
       ? Math.floor(t.duration_min/60)+"h "+(t.duration_min%60)+"m"
       : t.duration_min+" min";
+    var wayCount = t.osm_way_ids ? t.osm_way_ids.length : 0;
+    var wayBadge = wayCount > 0
+      ? "<span style='font-size:10px;color:#7c3aed;background:#ede9fe;border-radius:6px;padding:1px 5px;margin-left:4px;'>"+wayCount+" ways</span>"
+      : "";
     return "<div class='history-item"+(isActive?" active":"")+"' onclick='loadTripFromHistory("+i+")'>" +
       "<div class='hi-top'>" +
         "<span class='hi-num'>#"+(tripHistory.length-i)+"</span>" +
-        "<span class='hi-mode'>"+t.mode_icon+" "+t.mode+"</span>" +
+        "<span class='hi-mode'>"+t.mode_icon+" "+t.mode+wayBadge+"</span>" +
       "</div>" +
       "<div class='hi-meta'>"+durStr+" &nbsp;·&nbsp; "+t.distance_km+" km</div>" +
       "<div class='hi-time'>"+t.created_at+"</div>" +
@@ -492,6 +513,7 @@ function loadTripFromHistory(idx) {
   }
 
   renderRoutes(t.data, true, true);
+  showOsmPanel(t.osm_way_ids || [], t.intersection_coords || []);
 
   // Smooth fly to fit the loaded trip
   try {
@@ -563,6 +585,8 @@ function clearAll() {
   clearRoutes();
   ge("traffic-section").style.display = "none";
   ge("traffic-result").textContent = "";
+  ge("osm-section").style.display = "none";
+  _osmWayIds = []; _osmIntersectionCoords = [];
 }
 ge("btn-clear").onclick = clearAll;
 
@@ -767,7 +791,10 @@ function renderRoutes(data, fromHistory, skipFitBounds) {
   lastMode = ge("mode-select").value;
   ge("used-out").textContent = data.used_routing || "-";
   lastFeats = data.features || [];
-  if (!fromHistory) addTripToHistory(data);
+  if (!fromHistory) {
+    addTripToHistory(data);
+    showOsmPanel(data.osm_way_ids || [], data.intersection_coords || []);
+  }
   lastFeats.forEach(function(f, i) {
     var isMain = (i === 0);
     var l = L.geoJSON(f, {
@@ -953,6 +980,49 @@ function showTrafficPanel(routeIdx) {
   ge("traffic-result").textContent = "";
   selectedTrafficColor = null;
   ["red","orange","yellow"].forEach(function(c) { ge("td-" + c).classList.remove("active"); });
+}
+
+// ── OSM panel ───────────────────────────────────────────────────────────────
+var _osmWayIds = [];
+var _osmIntersectionCoords = [];
+
+function showOsmPanel(wayIds, intersectionCoords) {
+  _osmWayIds = wayIds || [];
+  _osmIntersectionCoords = intersectionCoords || [];
+  var sec = ge("osm-section");
+  if (!_osmWayIds.length && !_osmIntersectionCoords.length) {
+    sec.style.display = "none";
+    return;
+  }
+  sec.style.display = "block";
+  ge("osm-way-count").textContent = _osmWayIds.length + " ways";
+
+  // Render clickable chips — click opens OSM way in browser
+  ge("osm-way-grid").innerHTML = _osmWayIds.map(function(wid) {
+    return "<span class='osm-id-chip' title='Open in OSM' onclick='window.open(\"https://www.openstreetmap.org/way/"+wid+"\",\"_blank\")'>" + wid + "</span>";
+  }).join("");
+
+  ge("osm-intersect-info").innerHTML = _osmIntersectionCoords.length
+    ? "&#x1F4CD; " + _osmIntersectionCoords.length + " turn&nbsp;/&nbsp;intersection points along route"
+    : "";
+}
+
+function copyOsmIds() {
+  if (!_osmWayIds.length) return;
+  var text = _osmWayIds.join(", ");
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).catch(function() { _fallbackCopy(text); });
+  } else { _fallbackCopy(text); }
+  var btn = document.querySelector(".osm-copy-btn");
+  if (btn) { var orig = btn.innerHTML; btn.innerHTML = "&#10003; Copied!"; setTimeout(function(){ btn.innerHTML = orig; }, 1500); }
+}
+
+function _fallbackCopy(text) {
+  var ta = document.createElement("textarea");
+  ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta); ta.focus(); ta.select();
+  try { document.execCommand("copy"); } catch(e) {}
+  document.body.removeChild(ta);
 }
 
 async function loadBounds() {

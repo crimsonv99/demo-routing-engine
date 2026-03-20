@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>Routing Benchmark</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<style>
+  html, body, #map { margin:0; padding:0; height:100%; width:100%; background:#1a1a2e; }
+
+  .route-label {
+    background: rgba(0,0,0,0.75);
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    padding: 3px 7px;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+    pointer-events: none;
+  }
+
+  .leaflet-tooltip.route-label { box-shadow: none; }
+
+  #click-hint {
+    position: absolute;
+    bottom: 30px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0,0,0,0.7);
+    color: #fff;
+    padding: 6px 14px;
+    border-radius: 20px;
+    font-size: 13px;
+    z-index: 9999;
+    display: none;
+    pointer-events: none;
+  }
+
+  #info-panel {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    z-index: 9999;
+    background: rgba(20, 20, 35, 0.92);
+    border: 1px solid rgba(203, 166, 247, 0.35);
+    border-radius: 10px;
+    padding: 12px 16px;
+    min-width: 220px;
+    pointer-events: none;
+    font-family: 'Segoe UI', Arial, sans-serif;
+    backdrop-filter: blur(4px);
+  }
+  #info-panel.hidden { display: none; }
+  .ip-title {
+    color: #cba6f7;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+    border-bottom: 1px solid rgba(203,166,247,0.2);
+    padding-bottom: 5px;
+  }
+  .ip-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 5px;
+    gap: 12px;
+  }
+  .ip-label {
+    color: #a6adc8;
+    font-size: 10px;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .ip-value {
+    color: #cdd6f4;
+    font-size: 11px;
+    font-weight: 600;
+    text-align: right;
+    word-break: break-all;
+  }
+  .ip-value.highlight { color: #a6e3a1; font-size: 13px; }
+  .ip-divider {
+    border: none;
+    border-top: 1px solid rgba(203,166,247,0.15);
+    margin: 6px 0;
+  }
+  .ip-copy-btn {
+    background: rgba(203,166,247,0.15);
+    border: 1px solid rgba(203,166,247,0.3);
+    color: #cba6f7;
+    border-radius: 4px;
+    font-size: 9px;
+    padding: 1px 5px;
+    cursor: pointer;
+    pointer-events: all;
+    flex-shrink: 0;
+    transition: background 0.15s;
+  }
+  .ip-copy-btn:hover { background: rgba(203,166,247,0.3); }
+  .ip-copy-btn.copied { color: #a6e3a1; border-color: #a6e3a1; background: rgba(166,227,161,0.15); }
+  .ip-gmaps-btn {
+    display: block;
+    width: 100%;
+    margin-top: 10px;
+    padding: 6px 0;
+    background: rgba(66,133,244,0.2);
+    border: 1px solid rgba(66,133,244,0.5);
+    color: #7ab3f5;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    pointer-events: all;
+    text-align: center;
+    transition: background 0.15s;
+  }
+  .ip-gmaps-btn:hover { background: rgba(66,133,244,0.35); }
+
+  /* Traffic annotation */
+  .ip-traffic-title {
+    color: #fab387;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin: 10px 0 6px 0;
+    border-top: 1px solid rgba(203,166,247,0.15);
+    padding-top: 8px;
+  }
+  .ip-traffic-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 5px;
+    pointer-events: all;
+  }
+  .ip-traffic-dot {
+    width: 11px; height: 11px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    cursor: pointer;
+    border: 2px solid transparent;
+    transition: border-color .15s;
+  }
+  .ip-traffic-dot.active { border-color: #cdd6f4; }
+  .ip-traffic-label { font-size: 10px; color: #a6adc8; flex: 1; }
+  .ip-traffic-input {
+    width: 58px;
+    padding: 2px 5px;
+    background: #313244;
+    border: 1px solid #45475a;
+    border-radius: 4px;
+    color: #cdd6f4;
+    font-size: 10px;
+    pointer-events: all;
+  }
+  .ip-traffic-unit { font-size: 9px; color: #6c7086; }
+  .ip-traffic-btns { display: flex; gap: 5px; margin-top: 6px; pointer-events: all; }
+  .ip-traffic-btn {
+    flex: 1;
+    padding: 4px 0;
+    border-radius: 5px;
+    font-size: 10px;
+    font-weight: 600;
+    cursor: pointer;
+    border: none;
+    pointer-events: all;
+  }
+  .ip-traffic-btn.apply { background: #fab387; color: #1e1e2e; }
+  .ip-traffic-btn.apply:hover { background: #fbc49a; }
+  .ip-traffic-btn.clear  { background: #313244; color: #cdd6f4; }
+  .ip-traffic-btn.clear:hover  { background: #45475a; }
+  .ip-traffic-result {
+    font-size: 11px;
+    font-weight: 700;
+    color: #fab387;
+    margin-top: 5px;
+    min-height: 16px;
+  }
+  .ip-traffic-hint { font-size: 9px; color: #6c7086; margin-top: 2px; }
+
+  /* ── Right-click context menu ── */
+  #ctx-menu {
+    display: none;
+    position: fixed;
+    z-index: 99999;
+    min-width: 200px;
+    background: #1e1e2e;
+    border: 1px solid #45475a;
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.55);
+    overflow: hidden;
+    font-family: 'Segoe UI', Arial, sans-serif;
+    user-select: none;
+  }
+  #ctx-coords {
+    padding: 8px 14px 6px 14px;
+    font-size: 10px;
+    color: #6c7086;
+    border-bottom: 1px solid #313244;
+    cursor: default;
+    letter-spacing: 0.03em;
+  }
+  .ctx-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 14px;
+    font-size: 12px;
+    color: #cdd6f4;
+    cursor: pointer;
+    transition: background 0.12s;
+  }
+  .ctx-item:hover { background: #313244; }
+  .ctx-item .ctx-dot {
+    width: 11px; height: 11px;
+    border-radius: 50%;
+    border: 2px solid #fff;
+    flex-shrink: 0;
+  }
+  .ctx-sep {
+    height: 1px;
+    background: #313244;
+    margin: 0;
+  }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="click-hint"></div>
+
+<!-- Right-click context menu -->
+<div id="ctx-menu">
+  <div id="ctx-coords">0.000000, 0.000000</div>
+  <div class="ctx-item" onclick="ctxSetStart()">
+    <span class="ctx-dot" style="background:#22c55e;"></span>
+    Set as Start
+  </div>
+  <div class="ctx-item" onclick="ctxSetEnd()">
+    <span class="ctx-dot" style="background:#ef4444;"></span>
+    Set as End
+  </div>
+  <div class="ctx-sep"></div>
+  <div class="ctx-item" onclick="ctxCopyCoords()">
+    <span style="font-size:13px;line-height:1;">⎘</span>
+    Copy coordinates
+  </div>
+</div>
+
+<div id="info-panel" class="hidden">
+  <div class="ip-title">Route Info</div>
+  <div class="ip-row">
+    <span class="ip-label">Start</span>
+    <span class="ip-value" id="ip-start">—</span>
+    <button class="ip-copy-btn" onclick="copyCoord('ip-start', this)" title="Copy">⎘</button>
+  </div>
+  <div class="ip-row">
+    <span class="ip-label">Destination</span>
+    <span class="ip-value" id="ip-end">—</span>
+    <button class="ip-copy-btn" onclick="copyCoord('ip-end', this)" title="Copy">⎘</button>
+  </div>
+  <hr class="ip-divider"/>
+  <div class="ip-row">
+    <span class="ip-label">Duration</span>
+    <span class="ip-value highlight" id="ip-dur">—</span>
+  </div>
+  <div class="ip-row">
+    <span class="ip-label">Distance</span>
+    <span class="ip-value highlight" id="ip-dist">—</span>
+  </div>
+  <div class="ip-row">
+    <span class="ip-label">Engine</span>
+    <span class="ip-value" id="ip-engine">—</span>
+  </div>
+  <button class="ip-gmaps-btn" id="ip-gmaps-btn" onclick="openGoogleMaps()">
+    🗺 Compare in Google Maps
+  </button>
+
+  <!-- Traffic annotation -->
+  <div class="ip-traffic-title">🚦 Traffic Annotation</div>
+  <div style="font-size:9px;color:#6c7086;margin-bottom:6px;">Enter congestion length (m) along the route</div>
+
+  <div class="ip-traffic-row">
+    <div class="ip-traffic-dot" id="td-red" style="background:#ef4444;" title="Heavy jam (0.1× speed)" onclick="selectTraffic('red')"></div>
+    <span class="ip-traffic-label">Heavy jam</span>
+    <input class="ip-traffic-input" id="ti-red" type="number" min="0" value="0" placeholder="0"/>
+    <span class="ip-traffic-unit">m</span>
+  </div>
+  <div class="ip-traffic-row">
+    <div class="ip-traffic-dot" id="td-orange" style="background:#f97316;" title="Slow traffic (0.3× speed)" onclick="selectTraffic('orange')"></div>
+    <span class="ip-traffic-label">Slow traffic</span>
+    <input class="ip-traffic-input" id="ti-orange" type="number" min="0" value="0" placeholder="0"/>
+    <span class="ip-traffic-unit">m</span>
+  </div>
+  <div class="ip-traffic-row">
+    <div class="ip-traffic-dot" id="td-yellow" style="background:#eab308;" title="Moving slowly (0.5× speed)" onclick="selectTraffic('yellow')"></div>
+    <span class="ip-traffic-label">Moving slowly</span>
+    <input class="ip-traffic-input" id="ti-yellow" type="number" min="0" value="0" placeholder="0"/>
+    <span class="ip-traffic-unit">m</span>
+  </div>
+
+  <div class="ip-traffic-btns">
+    <button class="ip-traffic-btn apply" onclick="applyTraffic()">▶ Recalculate</button>
+    <button class="ip-traffic-btn clear"  onclick="clearTraffic()">✕ Clear</button>
+  </div>
+  <div id="traffic-result" class="ip-traffic-result"></div>
+  <div class="ip-traffic-hint">speed = base_speed × traffic_ratio</div>
+</div>
+
+<script>
+// ── Map setup ─────────────────────────────────────────────────────────
+var map = L.map('map', { zoomControl: true, attributionControl: true })
+           .setView([10.776, 106.7], 12);
+
+var BASEMAPS = {
+  "OSM": L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: "© OpenStreetMap contributors", maxZoom: 19
+  }),
+  "CartoDB Dark": L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+    attribution: "© CartoDB", maxZoom: 19
+  }),
+  "CartoDB Light": L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", {
+    attribution: "© CartoDB", maxZoom: 19
+  }),
+  "ESRI Satellite": L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {
+    attribution: "© Esri", maxZoom: 18
+  }),
+};
+BASEMAPS["OSM"].addTo(map);
+
+// ── State ─────────────────────────────────────────────────────────────
+var startMarker = null, endMarker = null;
+var routeLayers = {};   // engine → L.polyline
+var clickMode   = null; // "start" | "end" | null
+var bridge      = null;
+var viaMarkers  = [];   // draggable via-point handles
+
+// ── QWebChannel bridge ────────────────────────────────────────────────
+if (typeof QWebChannel !== "undefined") {
+  new QWebChannel(qt.webChannelTransport, function(channel) {
+    bridge = channel.objects.bridge;
+    bridge.click_mode_changed.connect(function(mode) {
+      clickMode = mode;
+      var hint = document.getElementById("click-hint");
+      if (mode === "start") {
+        hint.style.display = "block";
+        hint.textContent   = "Click on map to set Start point";
+      } else if (mode === "end") {
+        hint.style.display = "block";
+        hint.textContent   = "Click on map to set End point";
+      } else {
+        hint.style.display = "none";
+      }
+    });
+  });
+}
+
+// ── Map click ─────────────────────────────────────────────────────────
+map.on('click', function(e) {
+  if (!clickMode) return;
+  var lat = e.latlng.lat, lon = e.latlng.lng;
+  if (bridge) {
+    bridge.map_clicked(lat, lon);
+  }
+});
+
+// ── Markers ───────────────────────────────────────────────────────────
+var greenIcon = L.divIcon({
+  html: '<div style="background:#22c55e;width:14px;height:14px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 4px rgba(0,0,0,0.5)"></div>',
+  iconSize: [14, 14], iconAnchor: [7, 7], className: ''
+});
+var redIcon = L.divIcon({
+  html: '<div style="background:#ef4444;width:14px;height:14px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 4px rgba(0,0,0,0.5)"></div>',
+  iconSize: [14, 14], iconAnchor: [7, 7], className: ''
+});
+
+function setStart(lat, lon) {
+  if (startMarker) map.removeLayer(startMarker);
+  startMarker = L.marker([lat, lon], {icon: greenIcon, draggable: true})
+    .addTo(map)
+    .bindTooltip("Start", {permanent: true, direction: "top", offset: [0, -10]});
+  startMarker.on('dragend', function(e) {
+    var pos = e.target.getLatLng();
+    if (bridge) bridge.marker_dragged("start", pos.lat, pos.lng);
+  });
+}
+
+function setEnd(lat, lon) {
+  if (endMarker) map.removeLayer(endMarker);
+  endMarker = L.marker([lat, lon], {icon: redIcon, draggable: true})
+    .addTo(map)
+    .bindTooltip("End", {permanent: true, direction: "top", offset: [0, -10]});
+  endMarker.on('dragend', function(e) {
+    var pos = e.target.getLatLng();
+    if (bridge) bridge.marker_dragged("end", pos.lat, pos.lng);
+  });
+}
+
+// ── Via points (drag-to-reroute) ──────────────────────────────────────
+var viaIcon = L.divIcon({
+  className: '',
+  html: '<div style="width:14px;height:14px;background:#fff;border:3px solid #4A90D9;border-radius:50%;cursor:grab;box-shadow:0 1px 4px rgba(0,0,0,0.5);"></div>',
+  iconSize: [14, 14],
+  iconAnchor: [7, 7],
+});
+
+function _notifyViaChanged() {
+  if (!bridge) return;
+  var pts = viaMarkers.map(function(m) {
+    var p = m.getLatLng();
+    return [p.lat, p.lng];
+  });
+  bridge.via_points_changed(JSON.stringify(pts));
+}
+
+function _addViaMarker(lat, lng) {
+  var marker = L.marker([lat, lng], {
+    icon: viaIcon,
+    draggable: true,
+    zIndexOffset: 500,
+  }).addTo(map);
+
+  marker.on('dragend', function() {
+    _notifyViaChanged();
+  });
+
+  // Right-click removes the via point
+  marker.on('contextmenu', function(e) {
+    L.DomEvent.stopPropagation(e);
+    map.removeLayer(marker);
+    var idx = viaMarkers.indexOf(marker);
+    if (idx !== -1) viaMarkers.splice(idx, 1);
+    _notifyViaChanged();
+  });
+
+  viaMarkers.push(marker);
+}
+
+function clearViaPoints() {
+  viaMarkers.forEach(function(m) { map.removeLayer(m); });
+  viaMarkers = [];
+}
+
+// ── Routes ────────────────────────────────────────────────────────────
+function addRoute(engine, color, coordsJson, distKm, durMin) {
+  removeRoute(engine);
+  var coords = JSON.parse(coordsJson);   // [[lon, lat], ...]
+  var latlngs = coords.map(function(c) { return [c[1], c[0]]; });  // → [lat, lon]
+
+  var line = L.polyline(latlngs, {
+    color: color,
+    weight: 5,
+    opacity: 0.85,
+    smoothFactor: 1,
+  }).addTo(map);
+
+  // Double-click on route → add draggable via point
+  line.on('dblclick', function(e) {
+    L.DomEvent.stopPropagation(e);   // prevent map zoom-in
+    _addViaMarker(e.latlng.lat, e.latlng.lng);
+    _notifyViaChanged();
+  });
+
+  // Midpoint label
+  line.bindTooltip(
+    engine + " · " + durMin + " min · " + distKm + " km",
+    {permanent: false, sticky: true, className: "route-label"}
+  );
+
+  routeLayers[engine] = line;
+}
+
+function removeRoute(engine) {
+  if (routeLayers[engine]) {
+    map.removeLayer(routeLayers[engine]);
+    delete routeLayers[engine];
+  }
+}
+
+function clearRoutes() {
+  Object.keys(routeLayers).forEach(removeRoute);
+}
+
+function clearAll() {
+  clearRoutes();
+  clearViaPoints();
+  if (startMarker) { map.removeLayer(startMarker); startMarker = null; }
+  if (endMarker)   { map.removeLayer(endMarker);   endMarker   = null; }
+}
+
+function highlightRoute(engine) {
+  Object.keys(routeLayers).forEach(function(eng) {
+    var line = routeLayers[eng];
+    if (eng === engine) {
+      line.setStyle({weight: 8, opacity: 1.0});
+      line.bringToFront();
+    } else {
+      line.setStyle({weight: 4, opacity: 0.4});
+    }
+  });
+}
+
+function resetHighlight() {
+  Object.keys(routeLayers).forEach(function(eng) {
+    routeLayers[eng].setStyle({weight: 5, opacity: 0.85});
+  });
+}
+
+function setBasemap(name) {
+  Object.values(BASEMAPS).forEach(function(layer) {
+    if (map.hasLayer(layer)) map.removeLayer(layer);
+  });
+  if (BASEMAPS[name]) BASEMAPS[name].addTo(map);
+}
+
+function fitToRoutes() {
+  var all = [];
+  Object.values(routeLayers).forEach(function(line) {
+    line.getLatLngs().forEach(function(p) { all.push(p); });
+  });
+  if (all.length > 0) map.fitBounds(L.latLngBounds(all), {padding: [40, 40]});
+}
+
+// ── Info panel ────────────────────────────────────────────────────────
+var _ipStartLat = 0, _ipStartLon = 0, _ipEndLat = 0, _ipEndLon = 0;
+var _ipDistM = 0, _ipDurS = 0, _ipBaseDurStr = '';
+
+function updateInfoPanel(startLat, startLon, endLat, endLon, durStr, distStr, engine, engineColor, distKm, durS) {
+  _ipStartLat = startLat; _ipStartLon = startLon;
+  _ipEndLat   = endLat;   _ipEndLon   = endLon;
+  _ipDistM    = (distKm || 0) * 1000;
+  _ipDurS     = durS || 0;
+  _ipBaseDurStr = durStr;
+
+  document.getElementById('ip-start').textContent = startLat.toFixed(6) + ', ' + startLon.toFixed(6);
+  document.getElementById('ip-end').textContent   = endLat.toFixed(6)   + ', ' + endLon.toFixed(6);
+  document.getElementById('ip-dur').textContent   = durStr;
+  document.getElementById('ip-dist').textContent  = distStr;
+  var engEl = document.getElementById('ip-engine');
+  engEl.textContent = engine;
+  engEl.style.color = engineColor || '#cdd6f4';
+  document.getElementById('info-panel').classList.remove('hidden');
+  clearTraffic();
+}
+
+function clearInfoPanel() {
+  document.getElementById('info-panel').classList.add('hidden');
+  ['ip-start','ip-end','ip-dur','ip-dist','ip-engine'].forEach(function(id) {
+    document.getElementById(id).textContent = '—';
+  });
+  _ipStartLat = _ipStartLon = _ipEndLat = _ipEndLon = 0;
+  _ipDistM = _ipDurS = 0;
+  clearTraffic();
+}
+
+// ── Traffic annotation ────────────────────────────────────────────────
+var TRAFFIC_RATIOS = { red: 0.1, orange: 0.3, yellow: 0.5 };
+var _selectedTrafficColor = null;
+
+function selectTraffic(color) {
+  _selectedTrafficColor = color;
+  ['red','orange','yellow'].forEach(function(c) {
+    document.getElementById('td-' + c).classList.toggle('active', c === color);
+  });
+  document.getElementById('ti-' + color).focus();
+}
+
+function clearTraffic() {
+  ['red','orange','yellow'].forEach(function(c) {
+    var el = document.getElementById('ti-' + c);
+    if (el) el.value = 0;
+    var dot = document.getElementById('td-' + c);
+    if (dot) dot.classList.remove('active');
+  });
+  _selectedTrafficColor = null;
+  var res = document.getElementById('traffic-result');
+  if (res) res.textContent = '';
+  // Restore base duration label
+  var durEl = document.getElementById('ip-dur');
+  if (durEl && _ipBaseDurStr) durEl.textContent = _ipBaseDurStr;
+}
+
+function applyTraffic() {
+  if (_ipDurS <= 0 || _ipDistM <= 0) {
+    document.getElementById('traffic-result').textContent = 'No route data.';
+    return;
+  }
+  var baseSpeedMs = _ipDistM / _ipDurS;   // m/s
+
+  // Extra delay for each traffic segment
+  var extraS = 0;
+  ['red','orange','yellow'].forEach(function(c) {
+    var lenM = parseFloat(document.getElementById('ti-' + c).value) || 0;
+    if (lenM <= 0) return;
+    var ratio = TRAFFIC_RATIOS[c];
+    var freeFlowS = lenM / baseSpeedMs;
+    extraS += freeFlowS * (1.0 / ratio - 1.0);
+  });
+
+  if (extraS <= 0) {
+    document.getElementById('traffic-result').textContent = 'No traffic entered.';
+    return;
+  }
+
+  var newDurS   = _ipDurS + extraS;
+  var newH      = Math.floor(newDurS / 3600);
+  var newM      = Math.ceil((newDurS % 3600) / 60);
+  var newDurStr = newH > 0 ? newH + 'h ' + newM + 'min' : newM + ' min';
+  var delayMin  = Math.ceil(extraS / 60);
+
+  document.getElementById('traffic-result').innerHTML =
+    '<span style="color:#f38ba8">+' + delayMin + ' min delay</span> &nbsp;→&nbsp; ' +
+    '<strong style="color:#a6e3a1">' + newDurStr + '</strong> total';
+
+  // Update displayed duration in panel
+  document.getElementById('ip-dur').textContent = newDurStr + ' 🚦';
+}
+
+function _copyText(text) {
+  // Always go through the Python bridge — navigator.clipboard is blocked
+  // inside QWebEngineView's sandbox.
+  if (bridge && bridge.copy_to_clipboard) {
+    bridge.copy_to_clipboard(text);
+    return true;
+  }
+  return false;
+}
+
+function copyCoord(elemId, btn) {
+  var text = document.getElementById(elemId).textContent;
+  if (text === '—') return;
+  _copyText(text);
+  var orig = btn.textContent;
+  btn.textContent = '✓';
+  btn.classList.add('copied');
+  setTimeout(function() {
+    btn.textContent = orig;
+    btn.classList.remove('copied');
+  }, 1500);
+}
+
+// ── Restricted ways: dashed lines + buffer polygons ───────────────────
+var restrictedWayLayers     = {};   // id → {line: L.polyline, arrows: L.layerGroup}
+var restrictedPolygonLayers = {};   // id → L.polygon
+
+function addRestrictedPolygon(rid, ring) {
+  removeRestrictedPolygon(rid);
+  // ring = [[lon, lat], ...] (GeoJSON order) → convert to [[lat, lon]] for Leaflet
+  var latlngs = ring.map(function(c) { return [c[1], c[0]]; });
+  var poly = L.polygon(latlngs, {
+    color:       '#f97316',
+    weight:      1.5,
+    opacity:     0.8,
+    fillColor:   '#f97316',
+    fillOpacity: 0.12,
+    dashArray:   '4 4',
+  }).addTo(map);
+  restrictedPolygonLayers[String(rid)] = poly;
+}
+
+function removeRestrictedPolygon(rid) {
+  var key = String(rid);
+  if (restrictedPolygonLayers[key]) {
+    map.removeLayer(restrictedPolygonLayers[key]);
+    delete restrictedPolygonLayers[key];
+  }
+}
+
+function clearRestrictedPolygons() {
+  Object.keys(restrictedPolygonLayers).forEach(removeRestrictedPolygon);
+}
+
+// ── Direction arrow helpers ────────────────────────────────────────────
+function _segBearing(p1, p2) {
+  // Returns compass bearing 0-360° for segment p1→p2 (latlng arrays)
+  var dy = p2[0] - p1[0];
+  var dx = p2[1] - p1[1];
+  return (Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360;
+}
+
+function _arrowsAlongLine(nodes, reverse) {
+  // Place one chevron arrow at the midpoint of each segment.
+  // Cap at 8 arrows to avoid clutter on long ways.
+  var arrowGroup = L.layerGroup().addTo(map);
+  var step = Math.max(1, Math.ceil((nodes.length - 1) / 8));
+  for (var i = 0; i < nodes.length - 1; i += step) {
+    var p1 = nodes[i], p2 = nodes[i + 1];
+    var mid = [(p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2];
+    var bearing = _segBearing(p1, p2);
+    if (reverse) bearing = (bearing + 180) % 360;
+    // ▶ (U+25B6) normally points right (east = 90°).
+    // CSS rotation: clockwise from up, so east needs 90°.
+    // We want to rotate so it faces `bearing` (compass, 0°=north).
+    // rotationCss = bearing (▶ at 0° points east but we treat north=0)
+    // → subtract 90° so ▶ at rotation=0 faces north, +90 faces east, etc.
+    var rot = bearing - 90;
+    var icon = L.divIcon({
+      html: '<div style="color:#ef4444;font-size:13px;font-weight:bold;' +
+            'transform:rotate(' + rot + 'deg);transform-origin:center;' +
+            'line-height:1;user-select:none;pointer-events:none;">▶</div>',
+      iconSize: [13, 13],
+      iconAnchor: [6, 6],
+      className: '',
+    });
+    L.marker(mid, {icon: icon, interactive: false}).addTo(arrowGroup);
+  }
+  return arrowGroup;
+}
+
+// ── Restricted way rendering ───────────────────────────────────────────
+// direction: "2way" | "1way" (OSM forward) | "1way_reverse"
+function addRestrictedWay(wayId, latlngsJson, direction) {
+  removeRestrictedWay(wayId);
+  var nodes = JSON.parse(latlngsJson);   // [[lat, lon], ...]
+  if (!nodes || nodes.length < 2) return;
+
+  var line = L.polyline(nodes, {
+    color: '#ef4444',
+    weight: 3,
+    opacity: 0.9,
+    dashArray: '8, 5',
+  }).addTo(map);
+
+  var dirLabel = direction === '1way'         ? '  →  (OSM direction blocked)'
+               : direction === '1way_reverse' ? '  ←  (reverse blocked)'
+               : '  ↔  (both blocked)';
+  line.bindTooltip('🚫 Restricted: OSM Way ' + wayId + dirLabel,
+    {permanent: false, sticky: true, className: 'route-label'});
+
+  // Draw herringbone direction arrows for 1-way restrictions
+  var arrowGroup = null;
+  if (direction === '1way' || direction === '1way_reverse') {
+    arrowGroup = _arrowsAlongLine(nodes, direction === '1way_reverse');
+  }
+
+  restrictedWayLayers[String(wayId)] = {line: line, arrows: arrowGroup};
+}
+
+function removeRestrictedWay(wayId) {
+  var key = String(wayId);
+  if (restrictedWayLayers[key]) {
+    map.removeLayer(restrictedWayLayers[key].line);
+    if (restrictedWayLayers[key].arrows) {
+      map.removeLayer(restrictedWayLayers[key].arrows);
+    }
+    delete restrictedWayLayers[key];
+  }
+}
+
+function clearRestrictedWays() {
+  Object.keys(restrictedWayLayers).forEach(removeRestrictedWay);
+  clearRestrictedPolygons();
+}
+
+function openGoogleMaps() {
+  if (!_ipStartLat && !_ipEndLat) return;
+  var url = 'https://www.google.com/maps/dir/' +
+            _ipStartLat + ',' + _ipStartLon + '/' +
+            _ipEndLat   + ',' + _ipEndLon;
+  if (bridge && bridge.open_url) {
+    bridge.open_url(url);
+  } else {
+    window.open(url, '_blank');
+  }
+}
+
+// ── Right-click context menu ───────────────────────────────────────────
+var _ctxLat = 0, _ctxLon = 0;
+var _ctxMenu = document.getElementById('ctx-menu');
+
+map.on('contextmenu', function(e) {
+  _ctxLat = e.latlng.lat;
+  _ctxLon = e.latlng.lng;
+
+  // Update coords label
+  document.getElementById('ctx-coords').textContent =
+    _ctxLat.toFixed(6) + ',  ' + _ctxLon.toFixed(6);
+
+  // Position menu near cursor, keep inside viewport
+  var x = e.originalEvent.clientX;
+  var y = e.originalEvent.clientY;
+  _ctxMenu.style.display = 'block';
+  var mw = _ctxMenu.offsetWidth  || 200;
+  var mh = _ctxMenu.offsetHeight || 130;
+  if (x + mw > window.innerWidth)  x = x - mw;
+  if (y + mh > window.innerHeight) y = y - mh;
+  _ctxMenu.style.left = x + 'px';
+  _ctxMenu.style.top  = y + 'px';
+});
+
+// Close menu on any left-click or escape
+document.addEventListener('click', function(e) {
+  if (!_ctxMenu.contains(e.target)) _ctxMenu.style.display = 'none';
+});
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') _ctxMenu.style.display = 'none';
+});
+
+function _closeCtx() { _ctxMenu.style.display = 'none'; }
+
+function ctxSetStart() {
+  _closeCtx();
+  if (bridge) bridge.set_point('start', _ctxLat, _ctxLon);
+}
+
+function ctxSetEnd() {
+  _closeCtx();
+  if (bridge) bridge.set_point('end', _ctxLat, _ctxLon);
+}
+
+function ctxCopyCoords() {
+  _closeCtx();
+  var text = _ctxLat.toFixed(6) + ', ' + _ctxLon.toFixed(6);
+  _copyText(text);
+}
+</script>
+</body>
+</html>

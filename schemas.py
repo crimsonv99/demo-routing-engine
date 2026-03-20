@@ -85,6 +85,8 @@ class RouteResponse(BaseModel):
     routing_endpoints: Dict[str, LatLon]
     poi_snap: Optional[SnapInfo] = None
     used_routing: str
+    osm_way_ids: List[int] = []
+    intersection_coords: List[List[float]] = []
 
 
 # ── POI ───────────────────────────────────────────────────────────────────────
@@ -131,12 +133,18 @@ class TripRecord(BaseModel):
     planned_coords holds the [lon, lat] sequence of the best route (rank 0)
     so downstream tooling can compare a user's actual GPS trace against it
     without having to unwrap the full GeoJSON response.
+
+    osm_way_ids: ordered unique list of OSM way IDs the best route passes through.
+    intersection_coords: [lon, lat] of each turn/intersection along the best route.
+    These are intended for the restriction editor and route analysis tools.
     """
     trip_id: str
-    created_at: str                    # ISO-8601 UTC, e.g. "2026-03-17T10:23:45Z"
-    request: Dict[str, Any]            # original RouteRequest params
-    planned_coords: List[List[float]]  # [[lon, lat], …] best route geometry
-    response: RouteResponse            # full API response for reference
+    created_at: str                         # ISO-8601 UTC, e.g. "2026-03-17T10:23:45Z"
+    request: Dict[str, Any]                 # original RouteRequest params
+    planned_coords: List[List[float]]       # [[lon, lat], …] best route geometry
+    response: RouteResponse                 # full API response for reference
+    osm_way_ids: List[int] = []             # OSM way IDs traversed (best route, ordered unique)
+    intersection_coords: List[List[float]] = []  # [[lon, lat], …] at each turn/intersection
 
 
 # ── Standard error wrapper ────────────────────────────────────────────────────
