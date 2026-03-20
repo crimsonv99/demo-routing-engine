@@ -480,6 +480,55 @@ def _line_buffer_polygon(nodes: list[tuple[float, float]],
     return {"type": "Polygon", "coordinates": [ring]}
 
 
+def detect_geometry_change(stored: list, current: list) -> str | None:
+    """Compare stored geometry with current Overpass geometry.
+
+    Returns a human-readable reason string if the geometry has changed,
+    or None if it is effectively the same.
+
+    Checks (in order):
+      1. Way deleted / no longer exists → "Way no longer exists in OSM"
+      2. Node count changed (split, merge, added nodes) → reports old→new count + lengths
+      3. Endpoint coordinates shifted > ~3 m (way redrawn or extended)
+    """
+    import math
+
+    def _length_m(nodes: list) -> float:
+        total = 0.0
+        for i in range(len(nodes) - 1):
+            dlat = (nodes[i + 1][0] - nodes[i][0]) * 111_320.0
+            dlng = (nodes[i + 1][1] - nodes[i][1]) * 111_320.0 * math.cos(
+                math.radians(nodes[i][0])
+            )
+            total += math.sqrt(dlat ** 2 + dlng ** 2)
+        return total
+
+    def _close(a, b, tol: float = 0.00003) -> bool:   # tol ≈ 3 m
+        return abs(a[0] - b[0]) < tol and abs(a[1] - b[1]) < tol
+
+    if not current:
+        return "Way no longer exists in OSM"
+
+    sn, cn = len(stored), len(current)
+    if sn != cn:
+        sl = _length_m(stored)
+        cl = _length_m(current)
+        return (
+            f"Node count changed: {sn} → {cn}  |  "
+            f"Length: {sl:.0f} m → {cl:.0f} m"
+        )
+
+    if not _close(stored[0], current[0]) or not _close(stored[-1], current[-1]):
+        sl = _length_m(stored)
+        cl = _length_m(current)
+        return (
+            f"Endpoint nodes moved  |  "
+            f"Length: {sl:.0f} m → {cl:.0f} m"
+        )
+
+    return None   # no change detected
+
+
 def _fetch_osm_way_ids(url: str, coords: list[list[float]], costing: str) -> list[int]:
     """Call /trace_attributes to get deduplicated ordered OSM way IDs."""
     try:

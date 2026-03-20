@@ -72,6 +72,47 @@ class FetchNodeThread(QThread):
         self.done.emit(self.restriction_id, json.dumps(out) if out else "")
 
 
+class VerifyGeometryThread(QThread):
+    """Background thread that checks each RC restriction's stored geometry
+    against the current Overpass API data and reports any mismatches.
+
+    Signals
+    -------
+    mismatch_found(rec_id, way_id, reason)
+        Emitted once per way whose geometry has changed since the restriction
+        was created.  `reason` is a short human-readable description.
+    finished_all(checked, mismatches)
+        Emitted when all restrictions have been verified.
+    """
+    mismatch_found = pyqtSignal(str, int, str)   # rec_id, way_id, reason
+    finished_all   = pyqtSignal(int, int)         # total_checked, total_mismatches
+
+    def __init__(self, restrictions: list[dict]):
+        super().__init__()
+        self.restrictions = restrictions
+
+    def run(self):
+        from benchmark_engines.valhalla_engine import (
+            fetch_way_geometry_overpass, detect_geometry_change,
+        )
+        checked = mismatches = 0
+        for rec in self.restrictions:
+            if rec.get("type") != "RC":
+                continue
+            stored_geom = rec.get("geometry", {})
+            for way_id in rec.get("way_ids", []):
+                stored = stored_geom.get(str(way_id), [])
+                if not stored:
+                    continue   # geometry not yet fetched — skip
+                checked += 1
+                current = fetch_way_geometry_overpass(int(way_id))
+                reason  = detect_geometry_change(stored, current)
+                if reason:
+                    mismatches += 1
+                    self.mismatch_found.emit(rec["id"], way_id, reason)
+        self.finished_all.emit(checked, mismatches)
+
+
 # ── Python ↔ JS bridge ─────────────────────────────────────────────────────
 class Bridge(QObject):
     click_mode_changed = pyqtSignal(str)   # exposed to JS
@@ -1023,10 +1064,44 @@ class MainWindow(QMainWindow):
             self._draw_restriction_on_map(rec)
         n = len(self._restrictions)
         if n:
-            self._status.showMessage(f"Loaded {n} restriction(s) from disk")
-        n = len(self._restrictions)
-        if n:
-            self._status.showMessage(f"Loaded {n} restriction(s) from disk")
+            self._status.showMessage(
+                f"Loaded {n} restriction(s) from disk — verifying geometry against OSM…"
+            )
+            self._start_geometry_verification()
+
+    def _start_geometry_verification(self):
+        """Launch background thread to detect OSM geometry changes for all RC restrictions."""
+        rc_recs = [r for r in self._restrictions if r.get("type") == "RC"
+                   and r.get("geometry")]
+        if not rc_recs:
+            return
+        self._verify_thread = VerifyGeometryThread(rc_recs)
+        self._verify_thread.mismatch_found.connect(self._on_geometry_mismatch)
+        self._verify_thread.finished_all.connect(self._on_verify_finished)
+        self._verify_thread.start()
+
+    def _on_geometry_mismatch(self, rec_id: str, way_id: int, reason: str):
+        """Called for each restriction way whose OSM geometry has changed."""
+        # Store mismatch info on the record (in-memory only, not persisted)
+        for rec in self._restrictions:
+            if rec.get("id") == rec_id:
+                rec.setdefault("_mismatches", {})[str(way_id)] = reason
+                break
+        # Refresh list so the ⚠️ badge appears immediately
+        self._refresh_restriction_list()
+        print(f"[GeomVerify] ⚠ {rec_id} way {way_id}: {reason}")
+
+    def _on_verify_finished(self, checked: int, mismatches: int):
+        """Called when geometry verification is complete."""
+        if mismatches == 0:
+            self._status.showMessage(
+                f"Geometry check: all {checked} way(s) match current OSM ✓"
+            )
+        else:
+            self._status.showMessage(
+                f"⚠ {mismatches} restriction way(s) differ from current OSM — "
+                f"right-click the highlighted rule(s) to refresh geometry"
+            )
 
     # ── Restriction helpers ────────────────────────────────────────────
     def _is_restriction_active(self, rec: dict) -> bool:
@@ -1080,7 +1155,9 @@ class MainWindow(QMainWindow):
         dt_s  = rec.get("dt_start") or f"{rec.get('date_create','')} {rec.get('time_start','00:00')}"
         dt_e  = rec.get("dt_end")   or f"{rec.get('date_end','')} {rec.get('time_end','23:59')}"
         dir_part = f" {dir_badge}" if dir_badge else ""
-        return f"{status} {type_icon}{dir_part} {rid}  {name}  [{vtype}]  {dt_s}→{dt_e}"
+        # ⚠️ geometry mismatch badge (in-memory flag set by VerifyGeometryThread)
+        mismatch_badge = " ⚠" if rec.get("_mismatches") else ""
+        return f"{status}{mismatch_badge} {type_icon}{dir_part} {rid}  {name}  [{vtype}]  {dt_s}→{dt_e}"
 
     def _refresh_restriction_list(self):
         """Rebuild the list widget labels from current _restrictions state."""
@@ -1138,6 +1215,19 @@ class MainWindow(QMainWindow):
 
         act_edit = menu.addAction("✏️  Edit restriction")
         menu.addSeparator()
+
+        # Show refresh option if a geometry mismatch was detected
+        act_refresh = None
+        if rec.get("_mismatches") and rec.get("type") == "RC":
+            mismatches = rec["_mismatches"]
+            detail = "  |  ".join(
+                f"way {wid}: {reason}"
+                for wid, reason in mismatches.items()
+            )
+            act_refresh = menu.addAction(f"🔄  Refresh geometry from OSM")
+            act_refresh.setToolTip(detail)
+            menu.addSeparator()
+
         act_zoom = menu.addAction("🔍  Zoom to on map")
         menu.addSeparator()
         act_remove = menu.addAction("🗑  Remove from session")
@@ -1147,6 +1237,8 @@ class MainWindow(QMainWindow):
             self._toggle_restriction(row, not enabled)
         elif chosen == act_edit:
             self._edit_restriction(row)
+        elif act_refresh and chosen == act_refresh:
+            self._refresh_restriction_geometry(row)
         elif chosen == act_zoom:
             self._zoom_to_restriction_item(self._restrict_list.item(row))
         elif chosen == act_remove:
@@ -1162,6 +1254,43 @@ class MainWindow(QMainWindow):
         self._refresh_restriction_list()
         state = "enabled 🟢" if enabled else "disabled 🔴"
         self._status.showMessage(f"{rec.get('id','?')} {state}")
+
+    def _refresh_restriction_geometry(self, row: int):
+        """Re-fetch geometry from Overpass for a restriction whose OSM way was modified.
+
+        Clears the stored geometry and mismatch flags, then re-fetches fresh node
+        data from Overpass — exactly as if the restriction had just been created.
+        The new geometry is saved to disk once all ways have been fetched.
+        """
+        if row < 0 or row >= len(self._restrictions):
+            return
+        rec = self._restrictions[row]
+        if rec.get("type") != "RC":
+            return
+
+        rid = rec.get("id", "?")
+
+        # Remove old overlays from the map
+        for way_id in rec.get("way_ids", []):
+            self._js(f"removeRestrictedWay({way_id})")
+        self._js(f"removeRestrictedPolygon({json.dumps(rid)})")
+
+        # Clear stored geometry and mismatch flags
+        rec["geometry"] = {}
+        rec.pop("_mismatches", None)
+
+        # Invalidate the per-session Overpass cache so fresh data is fetched
+        from benchmark_engines.valhalla_engine import _WAY_GEOMETRY_CACHE
+        for way_id in rec.get("way_ids", []):
+            _WAY_GEOMETRY_CACHE.pop(int(way_id), None)
+
+        self._refresh_restriction_list()
+        self._status.showMessage(
+            f"{rid} — re-fetching geometry from Overpass…"
+        )
+
+        # Fetch fresh geometry (same path as create)
+        self._fetch_restriction_geometry(rec)
 
     def _edit_restriction(self, row: int):
         """Open the restriction dialog pre-filled with existing data for editing."""
