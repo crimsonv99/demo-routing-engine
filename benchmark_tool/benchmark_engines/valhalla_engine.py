@@ -26,12 +26,12 @@ _FERRY_ENTER_TYPE  = 28   # Valhalla maneuver enum: kFerryEnter
 # Keys match Valhalla road_class + GH road_class (lowercase).
 _HIGHWAY_PENALTY: dict[str, float] = {
     "motorway":      0.5,
-    "trunk":         0.8,
-    "primary":       1.3,
-    "secondary":     1.3,
+    "trunk":         0.6,
+    "primary":       0.8,
+    "secondary":     1.0,
     "tertiary":      1.3,
-    "unclassified":  3.0,
-    "residential":   1.0,
+    "unclassified":  2.0,
+    "residential":   3.0,
     "service_other": 5.0,   # Valhalla road_class for service/misc roads
     "service":       5.0,
     "living_street": 8.0,
