@@ -25,20 +25,29 @@ _FERRY_ENTER_TYPE  = 28   # Valhalla maneuver enum: kFerryEnter
 # Calibrated for Vietnamese road conditions.
 # Keys match Valhalla road_class + GH road_class (lowercase).
 _HIGHWAY_PENALTY: dict[str, float] = {
-    "motorway":      0.5,
-    "trunk":         0.6,
-    "primary":       0.8,
-    "secondary":     1.0,
-    "tertiary":      1.3,
-    "unclassified":  2.0,
-    "residential":   3.0,
-    "service_other": 5.0,   # Valhalla road_class for service/misc roads
-    "service":       5.0,
-    "living_street": 8.0,
-    "track":        15.0,
-    "path":         20.0,
-    "footway":      50.0,
-    "cycleway":     50.0,
+    # real_time = engine_free_flow_time × penalty × time_of_day_multiplier
+    #
+    # These are TIME multipliers, not speed ratios.
+    # 1.0 = same as engine free-flow.  2.0 = takes twice as long as free-flow.
+    # For HCMC: primary roads run ~19 km/h avg vs ~50 km/h OSM free-flow → ~2.65×.
+    # time_of_day_multiplier (0.70–1.35) layers on top for rush-hour variation.
+    #
+    #   relative rank preserved from user spec (motorway fastest → cycleway slowest)
+    #   absolute scale calibrated so primary × peak(1.35) ≈ Google Maps result
+    "motorway":      1.2,
+    "trunk":         1.4,
+    "primary":       1.9,
+    "secondary":     2.3,
+    "tertiary":      3.1,
+    "unclassified":  4.7,
+    "residential":   7.0,
+    "service_other": 12.0,   # Valhalla road_class for service/misc roads
+    "service":       12.0,
+    "living_street": 19.0,
+    "track":         35.0,
+    "path":          47.0,
+    "footway":      117.0,
+    "cycleway":     117.0,
 }
 
 # Valhalla `use` field overrides (more specific than road_class alone)
