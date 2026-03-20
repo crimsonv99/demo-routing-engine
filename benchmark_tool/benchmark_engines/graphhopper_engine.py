@@ -43,46 +43,63 @@ def _get_factor(mode: str, multiplier_override: float | None = None) -> float:
     return _BASE_FACTOR.get(mode, 2.50) * mult
 
 
-def _ferry_correction(path: dict) -> tuple[float, float]:
-    """Return (gh_ferry_ms, corrected_ferry_ms).
+def _compute_gh_duration(path: dict, time_mult: float) -> float:
+    """Compute corrected duration using per-segment highway penalties.
 
-    gh_ferry_ms       — time GH computed for ferry edges using OSM duration
-                        tags (typically ~4 km/h, far too slow).
-    corrected_ferry_ms — time at _FERRY_SPEED_KPH (10 km/h).
+    Builds per-point lookup tables from road_class, road_environment, and
+    average_speed detail intervals, then iterates over coordinate pairs to
+    apply the appropriate penalty × time_mult for each segment.
 
-    Strategy:
-      1. Find ferry coordinate intervals from road_environment detail.
-      2. Build a per-point speed map from average_speed detail.
-      3. For each ferry segment, compute haversine distance.
-      4. gh_time    = dist / gh_speed;   corrected_time = dist / _FERRY_SPEED_KPH
+    Ferry segments get _FERRY_SPEED_KPH, no time_mult (fixed schedule).
+    All other segments: free_flow_time × _HIGHWAY_PENALTY[road_class] × time_mult.
     """
-    coords = path["points"]["coordinates"]   # [[lon, lat], ...]
-    details = path.get("details", {})
+    from benchmark_engines.valhalla_engine import _HIGHWAY_PENALTY
 
-    # Build point-index → average_speed (km/h) lookup
+    coords  = path["points"]["coordinates"]   # [[lon, lat], ...]
+    details = path.get("details", {})
+    n       = len(coords)
+
+    # Build per-point speed map (km/h)
     speed_at: dict[int, float] = {}
-    for from_i, to_i, spd in details.get("average_speed", []):
-        for i in range(from_i, to_i):
+    for f, t, spd in details.get("average_speed", []):
+        for i in range(f, t):
             speed_at[i] = float(spd)
 
-    gh_ms   = 0.0
-    corr_ms = 0.0
+    # Build per-point road_class map (lowercase for penalty lookup)
+    rc_at: dict[int, str] = {}
+    for f, t, rc in details.get("road_class", []):
+        for i in range(f, t):
+            rc_at[i] = rc.lower()
 
-    for from_idx, to_idx, env in details.get("road_environment", []):
-        if env != "ferry":          # GH returns lowercase "ferry"
-            continue
-        for i in range(from_idx, min(to_idx, len(coords) - 1)):
-            a, b = coords[i], coords[i + 1]
-            mid_lat = math.radians((a[1] + b[1]) / 2)
-            dx = (b[0] - a[0]) * math.cos(mid_lat) * 111_320
-            dy = (b[1] - a[1]) * 110_540
-            seg_km = math.sqrt(dx * dx + dy * dy) / 1000.0
+    # Build per-point road_environment map (lowercase)
+    env_at: dict[int, str] = {}
+    for f, t, env in details.get("road_environment", []):
+        for i in range(f, t):
+            env_at[i] = env.lower()
 
-            gh_speed   = speed_at.get(i, 4.0)   # fallback 4 km/h
-            gh_ms   += seg_km / gh_speed          * 3_600_000
-            corr_ms += seg_km / _FERRY_SPEED_KPH * 3_600_000
+    duration_s = 0.0
+    _default_penalty = _HIGHWAY_PENALTY["unclassified"]
 
-    return gh_ms, corr_ms
+    for i in range(n - 1):
+        a, b = coords[i], coords[i + 1]
+        mid_lat = math.radians((a[1] + b[1]) / 2)
+        dx      = (b[0] - a[0]) * math.cos(mid_lat) * 111_320
+        dy      = (b[1] - a[1]) * 110_540
+        seg_km  = math.sqrt(dx * dx + dy * dy) / 1000.0
+
+        env   = env_at.get(i,   "road")
+        speed = speed_at.get(i, 30.0)
+
+        if env == "ferry":
+            # Ferry: fixed speed, no traffic factor
+            duration_s += seg_km / _FERRY_SPEED_KPH * 3600
+        elif speed > 0:
+            rc          = rc_at.get(i, "unclassified")
+            penalty     = _HIGHWAY_PENALTY.get(rc, _default_penalty)
+            free_flow_s = seg_km / speed * 3600
+            duration_s += free_flow_s * penalty * time_mult
+
+    return duration_s
 
 
 class GraphHopperEngine(BaseEngine):
@@ -115,10 +132,11 @@ class GraphHopperEngine(BaseEngine):
             "points":          points,
             "profile":         profile,
             "points_encoded":  False,
-            # road_environment → detect ferry segments post-route
-            # average_speed    → know the GH-calculated speed so we can
-            #                     compute the exact GH ferry time to subtract
-            "details":         ["osm_way_id", "road_environment", "average_speed"],
+            # road_class       → highway-type penalty lookup
+            # road_environment → detect ferry segments
+            # average_speed    → free-flow speed per segment for time calc
+            "details":         ["osm_way_id", "road_class",
+                                "road_environment", "average_speed"],
         }
 
         # Restriction enforcement via blocked_points (hard avoidance)
@@ -194,19 +212,16 @@ class GraphHopperEngine(BaseEngine):
                 if leaked:
                     print(f"[GraphHopper] ⚠ Route still uses restricted way(s): {leaked}")
 
-            # ── Ferry speed correction ─────────────────────────────────
-            # GH uses OSM duration tags for ferry speed (~4 km/h, too slow).
-            # We post-correct ferry segments to _FERRY_SPEED_KPH.
-            # Traffic multiplier is NOT applied to ferry (fixed schedule).
-            gh_ferry_ms, corr_ferry_ms = _ferry_correction(path)
-            if gh_ferry_ms > 0:
-                non_ferry_ms = path["time"] - gh_ferry_ms
-                duration_s   = (non_ferry_ms / 1000.0) * factor + (corr_ferry_ms / 1000.0)
-                print(f"[GraphHopper] ⛴ Ferry: "
-                      f"{corr_ferry_ms/1000/60:.1f} min @ {_FERRY_SPEED_KPH} km/h "
-                      f"(GH had {gh_ferry_ms/1000/60:.1f} min from OSM duration)")
-            else:
-                duration_s = (path["time"] / 1000.0) * factor
+            # ── Per-segment duration with highway penalties ────────────
+            # Replaces the single _BASE_FACTOR global multiplier.
+            # road_class + average_speed + road_environment details give us
+            # the free-flow speed per segment so we can apply the calibrated
+            # highway penalty for each road type.
+            # Ferry segments: _FERRY_SPEED_KPH, no traffic factor.
+            time_mult  = (self.traffic_multiplier
+                          if self.traffic_multiplier is not None
+                          else _time_of_day_multiplier())
+            duration_s = _compute_gh_duration(path, time_mult)
 
             return RouteResult(
                 engine      = self.NAME,

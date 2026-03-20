@@ -20,6 +20,41 @@ _MODE = {
 _FERRY_SPEED_KPH   = 10.0
 _FERRY_ENTER_TYPE  = 28   # Valhalla maneuver enum: kFerryEnter
 
+# ── Per-highway-type duration penalties ──────────────────────────────────────
+# real_time = engine_free_flow_time × penalty × time_of_day_multiplier
+# Calibrated for Vietnamese road conditions.
+# Keys match Valhalla road_class + GH road_class (lowercase).
+_HIGHWAY_PENALTY: dict[str, float] = {
+    "motorway":      0.5,
+    "trunk":         0.8,
+    "primary":       1.3,
+    "secondary":     1.3,
+    "tertiary":      1.3,
+    "unclassified":  3.0,
+    "residential":   1.0,
+    "service_other": 5.0,   # Valhalla road_class for service/misc roads
+    "service":       5.0,
+    "living_street": 8.0,
+    "track":        15.0,
+    "path":         20.0,
+    "footway":      50.0,
+    "cycleway":     50.0,
+}
+
+# Valhalla `use` field overrides (more specific than road_class alone)
+_VALHALLA_USE_PENALTY: dict[str, float] = {
+    "living_street": _HIGHWAY_PENALTY["living_street"],
+    "track":         _HIGHWAY_PENALTY["track"],
+    "path":          _HIGHWAY_PENALTY["path"],
+    "footway":       _HIGHWAY_PENALTY["footway"],
+    "cycleway":      _HIGHWAY_PENALTY["cycleway"],
+    "steps":         _HIGHWAY_PENALTY["footway"],
+    "service_road":  _HIGHWAY_PENALTY["service"],
+    "driveway":      _HIGHWAY_PENALTY["service"],
+    "alley":         _HIGHWAY_PENALTY["service"],
+    "parking_aisle": _HIGHWAY_PENALTY["service"],
+}
+
 _COSTING_OPTIONS = {
     "auto": {
         "use_highways":       1.0,
@@ -199,7 +234,22 @@ class ValhallaEngine(BaseEngine):
                 start_lat, start_lon, end_lat, end_lon,
                 costing, active, buffer_deg, via_points)
 
-            osm_way_ids = _fetch_osm_way_ids(self.url, coords, costing)
+            # ── Per-edge duration with highway penalties ───────────────
+            # Replaces the single _BASE_FACTOR global multiplier.
+            # trace_attributes → road_class / use / speed / length per edge
+            # → penalty × time_of_day multiplier per edge.
+            # Ferry edges are fixed at _FERRY_SPEED_KPH, no traffic factor.
+            time_mult = (self.traffic_multiplier
+                         if self.traffic_multiplier is not None
+                         else _time_of_day_multiplier())
+
+            edges = _fetch_route_edges(self.url, coords, costing)
+            if edges:
+                duration_s, osm_way_ids = _compute_valhalla_duration(edges, time_mult)
+            else:
+                # Fallback if trace_attributes failed
+                osm_way_ids = []
+                duration_s  = summary["time"] * factor
 
             # Warn if any RC way IDs still appear in the result
             if restrictions and osm_way_ids:
@@ -211,29 +261,6 @@ class ValhallaEngine(BaseEngine):
                 if leaked:
                     print(f"[Valhalla] ⚠ Route still uses restricted way(s): {leaked}"
                           f" — try increasing the buffer size.")
-
-            # ── Ferry speed correction ─────────────────────────────────
-            # Valhalla computes ferry time from OSM duration tags which are
-            # often too slow / inaccurate. Force _FERRY_SPEED_KPH instead.
-            # Traffic multiplier is NOT applied to ferries (fixed schedule).
-            ferry_raw_s  = 0.0
-            ferry_dist_km = 0.0
-            for m in maneuvers:
-                mtype = m.get("type", 0)
-                instr = (m.get("instruction", "") or "").lower()
-                if mtype == _FERRY_ENTER_TYPE or "ferry" in instr:
-                    ferry_dist_km += m.get("length", 0.0)
-                    ferry_raw_s   += m.get("time",   0.0)
-
-            if ferry_dist_km > 0:
-                ferry_corrected_s = ferry_dist_km / _FERRY_SPEED_KPH * 3600
-                non_ferry_raw_s   = summary["time"] - ferry_raw_s
-                duration_s        = non_ferry_raw_s * factor + ferry_corrected_s
-                print(f"[Valhalla] ⛴ Ferry: {ferry_dist_km:.2f} km "
-                      f"@ {_FERRY_SPEED_KPH} km/h → {ferry_corrected_s/60:.1f} min "
-                      f"(OSM had {ferry_raw_s/60:.1f} min)")
-            else:
-                duration_s = summary["time"] * factor
 
             return RouteResult(
                 engine      = self.NAME,
@@ -560,25 +587,74 @@ def detect_geometry_change(stored: list, current: list) -> str | None:
     return None   # no change detected
 
 
-def _fetch_osm_way_ids(url: str, coords: list[list[float]], costing: str) -> list[int]:
-    """Call /trace_attributes to get deduplicated ordered OSM way IDs."""
+def _fetch_route_edges(url: str, coords: list[list[float]], costing: str) -> list[dict]:
+    """Call /trace_attributes to get per-edge road data for weighted duration.
+
+    Fetches: way_id, road_class, speed (km/h), length (km), use (road type).
+    Returns the raw edge list from Valhalla, or [] on failure.
+    """
     try:
         shape = [{"lat": c[1], "lon": c[0]} for c in coords]
         body = {
             "shape": shape,
             "costing": costing,
             "shape_match": "map_snap",
-            "filters": {"attributes": ["edge.way_id"], "action": "include"},
+            "filters": {
+                "attributes": [
+                    "edge.way_id",
+                    "edge.road_class",
+                    "edge.speed",
+                    "edge.length",
+                    "edge.use",
+                ],
+                "action": "include",
+            },
         }
-        r = httpx.post(f"{url}/trace_attributes", json=body, timeout=10.0)
+        r = httpx.post(f"{url}/trace_attributes", json=body, timeout=15.0)
         r.raise_for_status()
-        edges = r.json().get("edges", [])
-        seen, result = set(), []
-        for e in edges:
-            wid = e.get("way_id")
-            if wid is not None and wid not in seen:
-                seen.add(wid)
-                result.append(int(wid))
-        return result
+        return r.json().get("edges", [])
     except Exception:
         return []
+
+
+def _compute_valhalla_duration(
+    edges: list[dict], time_mult: float
+) -> tuple[float, list[int]]:
+    """Compute corrected duration using per-edge highway penalties.
+
+    Returns (duration_seconds, ordered_unique_way_ids).
+    Ferry edges get _FERRY_SPEED_KPH, no traffic factor.
+    All other edges: free_flow_time × highway_penalty × time_mult.
+    """
+    duration_s = 0.0
+    seen_ids: set[int] = set()
+    way_ids:  list[int] = []
+
+    for e in edges:
+        length_km = float(e.get("length", 0.0))
+        speed_kmh = float(e.get("speed",  0.0))
+        use       = e.get("use",        "road")
+        rc        = e.get("road_class", "unclassified")
+
+        if speed_kmh <= 0 or length_km <= 0:
+            continue
+
+        free_flow_s = length_km / speed_kmh * 3600
+
+        if use in ("ferry", "rail_ferry"):
+            # Ferry: fixed speed, no time-of-day factor
+            edge_s = length_km / _FERRY_SPEED_KPH * 3600
+        elif use in _VALHALLA_USE_PENALTY:
+            edge_s = free_flow_s * _VALHALLA_USE_PENALTY[use] * time_mult
+        else:
+            penalty = _HIGHWAY_PENALTY.get(rc, _HIGHWAY_PENALTY["unclassified"])
+            edge_s  = free_flow_s * penalty * time_mult
+
+        duration_s += edge_s
+
+        wid = e.get("way_id")
+        if wid is not None and wid not in seen_ids:
+            seen_ids.add(wid)
+            way_ids.append(int(wid))
+
+    return duration_s, way_ids
