@@ -658,7 +658,7 @@ class MainWindow(QMainWindow):
         label, multiplier = TRAFFIC_PROFILES[idx]
 
         for eng in ENGINE_LIST:
-            if isinstance(eng, ValhallaEngine):
+            if hasattr(eng, "traffic_multiplier"):
                 eng.traffic_multiplier = multiplier
 
         if multiplier is None:

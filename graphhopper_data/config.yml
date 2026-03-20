@@ -1,0 +1,59 @@
+graphhopper:
+  datareader.file: /data/vietnam-latest.osm.pbf
+  graph.location: /data/graph-cache
+
+  # ── Profiles ─────────────────────────────────────────────────────────
+  # GH 11 format: profile name = vehicle, weighting defaults to custom.
+  # Motorcycle uses car_access internally (same road graph as car).
+  profiles:
+    - name: car
+      custom_model_files: [car.json]
+
+    - name: motorcycle
+      custom_model_files: [motorcycle.json]
+
+    - name: bike
+      custom_model_files: [bike.json]
+
+    - name: foot
+      custom_model_files: [foot.json]
+
+  # ── Speed modes ───────────────────────────────────────────────────────
+  # CH disabled — custom_model per-request (for restrictions) is
+  # incompatible with CH pre-computed shortcuts.
+  profiles_ch: []
+
+  # LM supports custom_model queries — good balance of speed + flexibility.
+  profiles_lm:
+    - profile: car
+    - profile: motorcycle
+    - profile: bike
+    - profile: foot
+
+  # ── Encoded values ────────────────────────────────────────────────────
+  # Union of all values required by car.json + motorcycle.json + bike.json + foot.json
+  # plus osm_way_id so route responses include the OSM way ID per edge.
+  graph.encoded_values: >
+    car_access, car_average_speed,
+    bike_access, bike_average_speed, bike_priority, bike_road_access,
+    foot_access, foot_average_speed, foot_priority, foot_road_access,
+    road_access, road_class, road_environment, surface,
+    track_type, roundabout, lanes,
+    mtb_rating, hike_rating, country,
+    osm_way_id
+
+  # ── Import ────────────────────────────────────────────────────────────
+  import.osm.ignored_highways: construction
+
+  graph.dataaccess.default_type: RAM_STORE
+
+  # ── Server ────────────────────────────────────────────────────────────
+  server:
+    application_connectors:
+      - type: http
+        port: 8989
+        bind_host: 0.0.0.0
+    admin_connectors:
+      - type: http
+        port: 8990
+        bind_host: 0.0.0.0
