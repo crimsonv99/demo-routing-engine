@@ -5,6 +5,9 @@ import datetime
 
 import httpx
 
+# Ferry routes run on fixed schedules — not affected by road traffic.
+_FERRY_SPEED_KPH = 10.0
+
 from benchmark_engines.base import BaseEngine, RouteResult
 
 # ── Profile mapping ────────────────────────────────────────────────────────
@@ -40,6 +43,28 @@ def _get_factor(mode: str, multiplier_override: float | None = None) -> float:
     return _BASE_FACTOR.get(mode, 2.50) * mult
 
 
+def _ferry_time_ms(path: dict) -> float:
+    """Return the milliseconds that belong to ferry segments in a GH path.
+
+    GH has already been told to route ferry at _FERRY_SPEED_KPH, so the
+    ferry portion's time in path["time"] is dist_km / _FERRY_SPEED_KPH * 3600s.
+    We measure ferry distance from the road_environment detail intervals.
+    """
+    coords = path["points"]["coordinates"]   # [[lon, lat], ...]
+    ferry_dist_m = 0.0
+    for interval in path.get("details", {}).get("road_environment", []):
+        from_idx, to_idx, env = interval
+        if env != "FERRY":
+            continue
+        for i in range(from_idx, min(to_idx, len(coords) - 1)):
+            a, b = coords[i], coords[i + 1]
+            mid_lat = math.radians((a[1] + b[1]) / 2)
+            dx = (b[0] - a[0]) * math.cos(mid_lat) * 111_320
+            dy = (b[1] - a[1]) * 110_540
+            ferry_dist_m += math.sqrt(dx * dx + dy * dy)
+    return (ferry_dist_m / 1000.0) / _FERRY_SPEED_KPH * 3_600_000   # ms
+
+
 class GraphHopperEngine(BaseEngine):
     NAME  = "GraphHopper"
     COLOR = "#EA580C"   # orange
@@ -70,7 +95,19 @@ class GraphHopperEngine(BaseEngine):
             "points":          points,
             "profile":         profile,
             "points_encoded":  False,
-            "details":         ["osm_way_id"],
+            "details":         ["osm_way_id", "road_environment"],
+            # Force ferry edges to exactly _FERRY_SPEED_KPH km/h.
+            # multiply_by:1000 boosts any OSM-derived speed to near-max;
+            # limit_to:_FERRY_SPEED_KPH then caps it precisely.
+            # Together they SET (not just cap) the speed for ferry edges.
+            "custom_model": {
+                "speed": [
+                    {"if": "road_environment == FERRY",
+                     "multiply_by": 1000},
+                    {"if": "road_environment == FERRY",
+                     "limit_to": _FERRY_SPEED_KPH},
+                ]
+            },
         }
 
         # Restriction enforcement via blocked_points (hard avoidance)
@@ -146,11 +183,24 @@ class GraphHopperEngine(BaseEngine):
                 if leaked:
                     print(f"[GraphHopper] ⚠ Route still uses restricted way(s): {leaked}")
 
+            # ── Ferry speed correction ─────────────────────────────────
+            # custom_model already forced ferry edges to _FERRY_SPEED_KPH.
+            # Traffic multiplier must NOT apply to ferry (fixed schedule).
+            f_ms = _ferry_time_ms(path)
+            if f_ms > 0:
+                non_ferry_ms = path["time"] - f_ms
+                duration_s   = (non_ferry_ms / 1000.0) * factor + (f_ms / 1000.0)
+                print(f"[GraphHopper] ⛴ Ferry: "
+                      f"{f_ms/1000/60:.1f} min @ {_FERRY_SPEED_KPH} km/h "
+                      f"(traffic factor not applied to ferry portion)")
+            else:
+                duration_s = (path["time"] / 1000.0) * factor
+
             return RouteResult(
                 engine      = self.NAME,
                 color       = self.COLOR,
                 distance_km = path["distance"] / 1000.0,
-                duration_s  = (path["time"] / 1000.0) * factor,   # GH returns ms
+                duration_s  = duration_s,
                 coordinates = coords,
                 osm_way_ids = osm_way_ids,
             )

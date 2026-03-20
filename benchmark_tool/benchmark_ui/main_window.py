@@ -1,21 +1,22 @@
 from __future__ import annotations
-import csv, json, os
+import csv, json, os, random
 from datetime import datetime
 from pathlib import Path
 
 import webbrowser
-from PyQt6.QtCore    import Qt, QObject, QThread, QUrl, pyqtSlot, pyqtSignal
+from PyQt6.QtCore    import Qt, QObject, QThread, QUrl, QTimer, pyqtSlot, pyqtSignal
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QCheckBox, QFileDialog,
     QTableWidget, QTableWidgetItem, QHeaderView, QSplitter,
     QGroupBox, QLineEdit, QListWidget, QStatusBar, QProgressBar,
-    QSizePolicy, QAbstractItemView, QMenu, QSpinBox,
+    QSizePolicy, QAbstractItemView, QMenu, QSpinBox, QTabWidget,
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore    import QWebEngineSettings
 from PyQt6.QtWebChannel       import QWebChannel
-from PyQt6.QtGui              import QColor, QFont
+from PyQt6.QtGui              import QColor, QFont, QFontMetrics, QPainter
+from PyQt6.QtCore             import QSize, QRect
 
 from benchmark_engines import (
     NetworkXEngine, ValhallaEngine, GraphHopperEngine, OSRMEngine,
@@ -37,6 +38,130 @@ ENGINE_LIST = [
     GraphHopperEngine(),
     OSRMEngine(),
 ]
+
+
+# ── Custom horizontal bar chart widget ─────────────────────────────────────
+class HorizontalBarChart(QWidget):
+    """Draws a multi-group horizontal bar chart using QPainter.
+
+    data  — list of (label, {metric_name: value}, color_hex)
+    metrics — ordered list of metric names to show per bar group
+    palette — {metric_name: bar_color_hex}  (overrides per-engine color for metrics)
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rows:    list[tuple[str, dict, str]] = []   # (label, {metric: val}, eng_color)
+        self._metrics: list[str] = []
+        self._unit    = ""
+        self._title   = ""
+        self.setMinimumHeight(60)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+    def set_data(self, rows: list[tuple[str, dict, str]],
+                 metrics: list[str], unit: str = "", title: str = ""):
+        self._rows    = rows
+        self._metrics = metrics
+        self._unit    = unit
+        self._title   = title
+        n   = len(rows)
+        m   = len(metrics)
+        bar = max(14, min(28, 22))
+        gap = 6
+        top = 28 if title else 10
+        self.setMinimumHeight(top + n * (m * (bar + gap) + 10) + 10)
+        self.update()
+
+    def sizeHint(self) -> QSize:
+        n   = len(self._rows)
+        m   = max(1, len(self._metrics))
+        return QSize(400, 28 + n * (m * 28 + 12) + 12)
+
+    def paintEvent(self, event):
+        if not self._rows or not self._metrics:
+            return
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        W = self.width()
+        label_w = 110
+        val_w   = 68
+        top_pad = 28 if self._title else 10
+        bar_h   = max(12, min(24, 20))
+        gap_bar = 4      # gap between metric bars in same group
+        gap_grp = 10     # gap between engine groups
+
+        # Metric alpha shading: first metric = full, subsequent = lighter
+        metric_alphas = [255, 170, 110]
+
+        # Global max across all metrics for uniform scale
+        max_val = max(
+            (v for _, d, _ in self._rows for v in d.values() if isinstance(v, (int, float))),
+            default=1.0
+        ) or 1.0
+
+        bar_area_w = W - label_w - val_w - 16
+
+        # Title
+        if self._title:
+            p.setPen(QColor("#a6adc8"))
+            p.setFont(QFont("Arial", 9))
+            p.drawText(QRect(4, 4, W - 8, 20), Qt.AlignmentFlag.AlignLeft, self._title)
+
+        y = top_pad
+        for label, data_dict, eng_color in self._rows:
+            group_top = y
+
+            for mi, metric in enumerate(self._metrics):
+                val = data_dict.get(metric, 0.0)
+                if val <= 0:
+                    y += bar_h + gap_bar
+                    continue
+
+                # Label (only on first metric of each group)
+                if mi == 0:
+                    p.setPen(QColor(eng_color))
+                    p.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+                    fm = QFontMetrics(p.font())
+                    lbl = fm.elidedText(label, Qt.TextElideMode.ElideRight, label_w - 8)
+                    p.drawText(QRect(4, y, label_w - 8, bar_h),
+                               Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                               lbl)
+                else:
+                    # Metric sub-label
+                    p.setPen(QColor("#6c7086"))
+                    p.setFont(QFont("Arial", 8))
+                    p.drawText(QRect(14, y, label_w - 18, bar_h),
+                               Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                               metric)
+
+                # Track background
+                tx = label_w
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor("#313244"))
+                p.drawRoundedRect(tx, y, bar_area_w, bar_h, 3, 3)
+
+                # Bar fill
+                fill_w = max(4, int(val / max_val * bar_area_w))
+                c = QColor(eng_color)
+                c.setAlpha(metric_alphas[min(mi, len(metric_alphas) - 1)])
+                p.setBrush(c)
+                p.drawRoundedRect(tx, y, fill_w, bar_h, 3, 3)
+
+                # Value text
+                val_str = f"{val:.0f}{(' ' + self._unit) if self._unit else ''}"
+                p.setPen(QColor("#cdd6f4"))
+                p.setFont(QFont("Arial", 8))
+                p.drawText(QRect(label_w + bar_area_w + 4, y, val_w - 4, bar_h),
+                           Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                           val_str)
+
+                y += bar_h + gap_bar
+
+            y += gap_grp
+
+        p.end()
 
 
 # ── Background thread: fetch way geometry from Overpass ────────────────────
@@ -185,6 +310,20 @@ class MainWindow(QMainWindow):
         # Trip history — list of dicts, newest first
         self._trip_history: list[dict] = []
         self._current_run_results: list = []   # accumulates during _do_route
+
+        # Per-engine benchmark stats {name: {trips, ok, total_ms, min_ms, max_ms, total_km}}
+        self._bench_stats: dict[str, dict] = {
+            eng.NAME: {"trips": 0, "ok": 0, "total_ms": 0.0,
+                       "min_ms": float("inf"), "max_ms": 0.0, "total_km": 0.0}
+            for eng in ENGINE_LIST
+        }
+
+        # Batch random trip runner state
+        self._batch_remaining: int = 0
+        self._batch_total:     int = 0
+
+        # Failed trips log for investigation
+        self._failed_trips: list[dict] = []
 
         # Restriction records (RC / TR), loaded from disk + added live
         self._restrictions: list[dict] = []
@@ -410,6 +549,57 @@ class MainWindow(QMainWindow):
         playout.addWidget(self._btn_route)
         playout.addWidget(self._btn_clear)
 
+        # ── Random Trip ────────────────────────────────────────────────
+        g_rand = self._group("Benchmark")
+        self._btn_random = self._button("🎲  Random Trip")
+        self._btn_random.setToolTip("Generate random start+end within current map view and route")
+        self._btn_random.clicked.connect(self._random_trip)
+
+        batch_row = QHBoxLayout()
+        self._batch_spin = QSpinBox()
+        self._batch_spin.setRange(1, 9999)
+        self._batch_spin.setValue(10)
+        self._batch_spin.setFixedWidth(65)
+        self._batch_spin.setStyleSheet(
+            "QSpinBox{background:#313244;color:#cdd6f4;border:1px solid #45475a;"
+            "border-radius:4px;padding:2px 4px;font-size:10px;}"
+            "QSpinBox::up-button,QSpinBox::down-button{width:14px;}"
+        )
+        self._btn_batch = QPushButton("▶ Run N")
+        self._btn_batch.setFixedHeight(24)
+        self._btn_batch.setStyleSheet(
+            "QPushButton{background:#89dceb;color:#1e1e2e;border-radius:4px;"
+            "font-weight:700;font-size:10px;padding:2px 6px;}"
+            "QPushButton:hover{background:#a6e8f5;}"
+            "QPushButton:disabled{background:#45475a;color:#6c7086;}"
+        )
+        self._btn_batch.clicked.connect(self._start_batch)
+        self._btn_batch_stop = QPushButton("■ Stop")
+        self._btn_batch_stop.setFixedHeight(24)
+        self._btn_batch_stop.setEnabled(False)
+        self._btn_batch_stop.setStyleSheet(
+            "QPushButton{background:#f38ba8;color:#1e1e2e;border-radius:4px;"
+            "font-weight:700;font-size:10px;padding:2px 6px;}"
+            "QPushButton:hover{background:#ff9aac;}"
+            "QPushButton:disabled{background:#45475a;color:#6c7086;}"
+        )
+        self._btn_batch_stop.clicked.connect(self._stop_batch)
+        batch_row.addWidget(self._batch_spin)
+        batch_row.addWidget(self._btn_batch)
+        batch_row.addWidget(self._btn_batch_stop)
+
+        self._batch_progress = QProgressBar()
+        self._batch_progress.setRange(0, 100)
+        self._batch_progress.setVisible(False)
+        self._batch_progress.setStyleSheet(
+            "QProgressBar{background:#313244;border-radius:4px;height:6px;text-align:center;}"
+            "QProgressBar::chunk{background:#89dceb;border-radius:4px;}"
+        )
+        g_rand.layout().addWidget(self._btn_random)
+        g_rand.layout().addLayout(batch_row)
+        g_rand.layout().addWidget(self._batch_progress)
+        playout.addWidget(g_rand)
+
         # ── NetworkX load progress ─────────────────────────────────────
         self._nx_progress = QProgressBar()
         self._nx_progress.setRange(0, 0)
@@ -422,11 +612,26 @@ class MainWindow(QMainWindow):
 
         playout.addStretch()
 
-        # ── Right side: map + results + history ────────────────────────
+        # ── Right side: tab widget (Map | Dashboard) ───────────────────
         right   = QWidget()
         rlayout = QVBoxLayout(right)
         rlayout.setContentsMargins(0, 0, 0, 0)
         rlayout.setSpacing(0)
+
+        self._tabs = QTabWidget()
+        self._tabs.setStyleSheet(
+            "QTabWidget::pane{border:none;}"
+            "QTabBar::tab{background:#313244;color:#a6adc8;padding:6px 18px;"
+            "border-radius:4px 4px 0 0;margin-right:2px;font-size:11px;}"
+            "QTabBar::tab:selected{background:#1e1e2e;color:#cba6f7;font-weight:700;}"
+            "QTabBar::tab:hover{background:#45475a;}"
+        )
+
+        # ── Map tab ────────────────────────────────────────────────────
+        map_tab = QWidget()
+        map_tab_layout = QVBoxLayout(map_tab)
+        map_tab_layout.setContentsMargins(0, 0, 0, 0)
+        map_tab_layout.setSpacing(0)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
 
@@ -568,7 +773,15 @@ class MainWindow(QMainWindow):
 
         splitter.setSizes([560, 160, 160])
 
-        rlayout.addWidget(splitter)
+        map_tab_layout.addWidget(splitter)
+
+        # ── Dashboard tab ──────────────────────────────────────────────
+        self._dash_tab = self._build_dashboard_tab()
+
+        self._tabs.addTab(map_tab,        "🗺  Map")
+        self._tabs.addTab(self._dash_tab, "📊  Dashboard")
+
+        rlayout.addWidget(self._tabs)
 
         root.addWidget(panel)
         root.addWidget(right, 1)
@@ -578,6 +791,178 @@ class MainWindow(QMainWindow):
         self._status.setStyleSheet("background:#181825; color:#a6adc8;")
         self.setStatusBar(self._status)
         self._status.showMessage("Ready — load a road network and click Set Start / Set End")
+
+    # ── Dashboard tab builder ──────────────────────────────────────────
+    def _build_dashboard_tab(self) -> QWidget:
+        w = QWidget()
+        w.setStyleSheet("background:#11111b; color:#cdd6f4;")
+        root = QVBoxLayout(w)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(10)
+
+        # ── Header ──────────────────────────────────────────────────
+        hdr_row = QHBoxLayout()
+        title_lbl = QLabel("📊 Benchmark Dashboard")
+        title_lbl.setFont(QFont("Arial", 13, QFont.Weight.Bold))
+        title_lbl.setStyleSheet("color:#cba6f7;")
+        hdr_row.addWidget(title_lbl)
+        hdr_row.addStretch()
+        btn_clear_stats = QPushButton("🗑 Clear Stats")
+        btn_clear_stats.setFixedHeight(26)
+        btn_clear_stats.setStyleSheet(
+            "QPushButton{background:#313244;color:#f38ba8;border-radius:4px;"
+            "padding:2px 10px;font-size:10px;}"
+            "QPushButton:hover{background:#45475a;}"
+        )
+        btn_clear_stats.clicked.connect(self._clear_bench_stats)
+        hdr_row.addWidget(btn_clear_stats)
+        root.addLayout(hdr_row)
+
+        self._dash_summary_lbl = QLabel(
+            "No trips recorded yet — use 🎲 Random Trip or ▶ Run N"
+        )
+        self._dash_summary_lbl.setStyleSheet("color:#a6adc8; font-size:11px;")
+        root.addWidget(self._dash_summary_lbl)
+
+        # ── Main vertical splitter: top (stats+chart) | bottom (failures) ──
+        v_split = QSplitter(Qt.Orientation.Vertical)
+        v_split.setStyleSheet(
+            "QSplitter::handle{background:#313244; height:3px;}"
+        )
+
+        # ── Top: stats table (left) + bar chart (right) side by side ──
+        top_widget = QWidget()
+        top_widget.setStyleSheet("background:transparent;")
+        top_layout = QHBoxLayout(top_widget)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(12)
+
+        # Stats table
+        self._dash_table = QTableWidget(0, 7)
+        self._dash_table.setHorizontalHeaderLabels([
+            "Engine", "Trips", "Success %", "Avg ms", "Min ms", "Max ms", "Avg km",
+        ])
+        hh = self._dash_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col in range(1, 7):
+            hh.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+        for col, w_px in enumerate([55, 75, 70, 65, 65, 65], start=1):
+            self._dash_table.setColumnWidth(col, w_px)
+        self._dash_table.setStyleSheet(
+            "QTableWidget{background:#181825;color:#cdd6f4;"
+            "gridline-color:#313244;border:none;border-radius:6px;}"
+            "QHeaderView::section{background:#313244;color:#a6adc8;"
+            "border:none;padding:5px;font-size:10px;}"
+            "QTableWidget::item{padding:5px;}"
+            "QTableWidget::item:selected{background:#313244;}"
+        )
+        self._dash_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self._dash_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._dash_table.verticalHeader().setVisible(False)
+        top_layout.addWidget(self._dash_table, 3)
+
+        # Bar chart panel (right side)
+        chart_panel = QWidget()
+        chart_panel.setStyleSheet(
+            "background:#181825; border-radius:6px;"
+        )
+        chart_panel_layout = QVBoxLayout(chart_panel)
+        chart_panel_layout.setContentsMargins(10, 10, 10, 10)
+        chart_panel_layout.setSpacing(4)
+
+        chart_lbl = QLabel("Response time  (Avg · Min · Max) — lower is faster")
+        chart_lbl.setStyleSheet("color:#a6adc8; font-size:10px;")
+        chart_panel_layout.addWidget(chart_lbl)
+
+        from PyQt6.QtWidgets import QScrollArea
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(
+            "QScrollArea{border:none; background:transparent;}"
+            "QScrollBar:vertical{width:6px;background:#181825;}"
+            "QScrollBar::handle:vertical{background:#45475a;border-radius:3px;}"
+        )
+        self._bar_chart = HorizontalBarChart()
+        self._bar_chart.setStyleSheet("background:transparent;")
+        scroll.setWidget(self._bar_chart)
+        chart_panel_layout.addWidget(scroll, 1)
+        top_layout.addWidget(chart_panel, 4)
+
+        v_split.addWidget(top_widget)
+
+        # ── Bottom: failed trips ──────────────────────────────────────
+        fail_widget = QWidget()
+        fail_widget.setStyleSheet("background:transparent;")
+        fail_layout = QVBoxLayout(fail_widget)
+        fail_layout.setContentsMargins(0, 4, 0, 0)
+        fail_layout.setSpacing(4)
+
+        fail_hdr = QHBoxLayout()
+        self._fail_count_lbl = QLabel("❌ Failed Trips: 0")
+        self._fail_count_lbl.setStyleSheet(
+            "color:#f38ba8; font-weight:700; font-size:11px;"
+        )
+        fail_hdr.addWidget(self._fail_count_lbl)
+        fail_hdr.addStretch()
+
+        btn_fail_replay = QPushButton("↩ Replay on Map")
+        btn_fail_replay.setFixedHeight(24)
+        btn_fail_replay.setStyleSheet(
+            "QPushButton{background:#313244;color:#cdd6f4;border-radius:4px;"
+            "padding:2px 10px;font-size:10px;}"
+            "QPushButton:hover{background:#45475a;}"
+        )
+        btn_fail_replay.clicked.connect(self._replay_failed_trip)
+        fail_hdr.addWidget(btn_fail_replay)
+
+        btn_fail_clear = QPushButton("🗑 Clear")
+        btn_fail_clear.setFixedHeight(24)
+        btn_fail_clear.setStyleSheet(
+            "QPushButton{background:#313244;color:#f38ba8;border-radius:4px;"
+            "padding:2px 8px;font-size:10px;}"
+            "QPushButton:hover{background:#45475a;}"
+        )
+        btn_fail_clear.clicked.connect(self._clear_failed_trips)
+        fail_hdr.addWidget(btn_fail_clear)
+        fail_layout.addLayout(fail_hdr)
+
+        self._fail_table = QTableWidget(0, 6)
+        self._fail_table.setHorizontalHeaderLabels([
+            "#", "Time", "Engine", "Mode", "Error", "Coords (start → end)",
+        ])
+        fhh = self._fail_table.horizontalHeader()
+        fhh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        fhh.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        fhh.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        fhh.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        fhh.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        fhh.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self._fail_table.setColumnWidth(0, 36)
+        self._fail_table.setColumnWidth(1, 130)
+        self._fail_table.setColumnWidth(2, 90)
+        self._fail_table.setColumnWidth(3, 70)
+        self._fail_table.setStyleSheet(
+            "QTableWidget{background:#181825;color:#cdd6f4;"
+            "gridline-color:#313244;border:none;border-radius:6px;}"
+            "QHeaderView::section{background:#313244;color:#a6adc8;"
+            "border:none;padding:4px;font-size:10px;}"
+            "QTableWidget::item{padding:4px;}"
+            "QTableWidget::item:selected{background:#45475a;}"
+        )
+        self._fail_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._fail_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._fail_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._fail_table.verticalHeader().setVisible(False)
+        self._fail_table.cellDoubleClicked.connect(
+            lambda r, _: self._replay_failed_trip_row(r)
+        )
+        fail_layout.addWidget(self._fail_table, 1)
+
+        v_split.addWidget(fail_widget)
+        v_split.setSizes([420, 200])
+
+        root.addWidget(v_split, 1)
+        return w
 
     # ── Map setup ──────────────────────────────────────────────────────
     def _setup_map(self):
@@ -723,6 +1108,311 @@ class MainWindow(QMainWindow):
             self._end_lbl.setText("not set")
             self._js("if(endMarker){map.removeLayer(endMarker);endMarker=null;}")
 
+    # ── Random Trip ────────────────────────────────────────────────────
+    def _random_trip(self):
+        """Pick random start+end within current Leaflet viewport and route."""
+        self._map_view.page().runJavaScript(
+            "[map.getBounds().getSouthWest().lat,"
+            " map.getBounds().getSouthWest().lng,"
+            " map.getBounds().getNorthEast().lat,"
+            " map.getBounds().getNorthEast().lng]",
+            self._apply_random_trip,
+        )
+
+    def _apply_random_trip(self, bounds):
+        if not bounds or len(bounds) < 4:
+            self._status.showMessage("Cannot get map bounds — is the map loaded?")
+            return
+        min_lat, min_lon, max_lat, max_lon = bounds
+        lat1 = random.uniform(min_lat, max_lat)
+        lon1 = random.uniform(min_lon, max_lon)
+        lat2 = random.uniform(min_lat, max_lat)
+        lon2 = random.uniform(min_lon, max_lon)
+        self._do_clear()
+        self.on_start_set(lat1, lon1)
+        self.on_end_set(lat2, lon2)
+        self._do_route()
+
+    # ── Batch runner ───────────────────────────────────────────────────
+    def _start_batch(self):
+        n = self._batch_spin.value()
+        self._batch_total     = n
+        self._batch_remaining = n
+        self._btn_batch.setEnabled(False)
+        self._btn_batch_stop.setEnabled(True)
+        self._batch_progress.setRange(0, n)
+        self._batch_progress.setValue(0)
+        self._batch_progress.setVisible(True)
+        # Switch to dashboard tab so user can watch stats live
+        self._tabs.setCurrentWidget(self._dash_tab)
+        self._run_next_batch_trip()
+
+    def _stop_batch(self):
+        self._batch_remaining = 0
+        self._btn_batch.setEnabled(True)
+        self._btn_batch_stop.setEnabled(False)
+        self._batch_progress.setVisible(False)
+        self._status.showMessage("Batch stopped")
+
+    def _run_next_batch_trip(self):
+        if self._batch_remaining <= 0:
+            self._btn_batch.setEnabled(True)
+            self._btn_batch_stop.setEnabled(False)
+            self._batch_progress.setVisible(False)
+            done = self._batch_total - self._batch_remaining
+            self._status.showMessage(f"Batch complete — {done} trips run")
+            return
+        done = self._batch_total - self._batch_remaining
+        self._batch_progress.setValue(done)
+        self._status.showMessage(
+            f"Batch: {done}/{self._batch_total} — running trip {done+1}…"
+        )
+        self._map_view.page().runJavaScript(
+            "[map.getBounds().getSouthWest().lat,"
+            " map.getBounds().getSouthWest().lng,"
+            " map.getBounds().getNorthEast().lat,"
+            " map.getBounds().getNorthEast().lng]",
+            self._apply_batch_trip,
+        )
+
+    def _apply_batch_trip(self, bounds):
+        if not bounds or len(bounds) < 4 or self._batch_remaining <= 0:
+            self._stop_batch()
+            return
+        min_lat, min_lon, max_lat, max_lon = bounds
+        lat1 = random.uniform(min_lat, max_lat)
+        lon1 = random.uniform(min_lon, max_lon)
+        lat2 = random.uniform(min_lat, max_lat)
+        lon2 = random.uniform(min_lon, max_lon)
+        self._batch_remaining -= 1
+        # Set points silently (no map transition)
+        self._start = (lat1, lon1)
+        self._end   = (lat2, lon2)
+        self._start_lbl.setText(f"{lat1:.5f}, {lon1:.5f}")
+        self._end_lbl.setText(f"{lat2:.5f}, {lon2:.5f}")
+        self._js(f"setStart({lat1}, {lon1})")
+        self._js(f"setEnd({lat2}, {lon2})")
+        self._do_route()
+        # _on_all_done → _on_batch_trip_done is wired below
+
+    # ── Dashboard stats ────────────────────────────────────────────────
+    def _record_bench_result(self, result):
+        """Update per-engine stats from a single RouteResult."""
+        s = self._bench_stats.get(result.engine)
+        if s is None:
+            return
+        s["trips"] += 1
+        if result.ok:
+            s["ok"]       += 1
+            s["total_ms"] += result.elapsed_ms
+            s["min_ms"]    = min(s["min_ms"], result.elapsed_ms)
+            s["max_ms"]    = max(s["max_ms"], result.elapsed_ms)
+            s["total_km"] += result.distance_km
+        else:
+            self._failed_trips.append({
+                "ts":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "engine": result.engine,
+                "mode":   self._mode_combo.currentText(),
+                "start":  self._start,
+                "end":    self._end,
+                "error":  result.error or "unknown",
+            })
+
+    def _update_dashboard(self):
+        """Refresh the dashboard table, bar chart, and failed trips from _bench_stats."""
+        t = self._dash_table
+        t.setRowCount(0)
+
+        valid = {
+            name: s for name, s in self._bench_stats.items()
+            if s["trips"] > 0
+        }
+        total_trips = sum(s["trips"] for s in valid.values())
+
+        # Update failed trips table
+        self._refresh_fail_table()
+
+        if total_trips == 0:
+            self._dash_summary_lbl.setText(
+                "No trips recorded yet — use 🎲 Random Trip or ▶ Run N"
+            )
+            self._bar_chart.set_data([], [])
+            return
+
+        total_ok = sum(s["ok"] for s in valid.values())
+        n_fail   = sum(s["trips"] - s["ok"] for s in valid.values())
+        self._dash_summary_lbl.setText(
+            f"Total trips: {total_trips}  |  "
+            f"Successful: {total_ok}  |  "
+            f"Failed: {n_fail}  |  "
+            f"Engines: {len(valid)}"
+        )
+
+        # Sort by avg response (fastest first)
+        eng_order = sorted(
+            valid.keys(),
+            key=lambda n: (
+                valid[n]["total_ms"] / valid[n]["ok"]
+                if valid[n]["ok"] else float("inf")
+            )
+        )
+
+        avg_ms_list = [
+            valid[n]["total_ms"] / valid[n]["ok"] if valid[n]["ok"] else 0
+            for n in eng_order
+        ]
+        fastest_avg = min((v for v in avg_ms_list if v > 0), default=None)
+
+        def dcell(text, color=None, align=Qt.AlignmentFlag.AlignCenter):
+            item = QTableWidgetItem(text)
+            item.setTextAlignment(align)
+            if color:
+                item.setForeground(QColor(color))
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            return item
+
+        for name in eng_order:
+            s       = self._bench_stats[name]
+            eng_obj = next((e for e in ENGINE_LIST if e.NAME == name), None)
+            color   = eng_obj.COLOR if eng_obj else "#cdd6f4"
+
+            ok    = s["ok"]
+            trips = s["trips"]
+            avg_ms  = s["total_ms"] / ok if ok else 0
+            min_ms  = s["min_ms"]    if ok else 0
+            max_ms  = s["max_ms"]    if ok else 0
+            avg_km  = s["total_km"] / ok if ok else 0
+            pct     = int(100 * ok / trips) if trips else 0
+
+            row = t.rowCount()
+            t.insertRow(row)
+            t.setRowHeight(row, 30)
+            t.setItem(row, 0, dcell(name, color))
+            t.setItem(row, 1, dcell(str(trips)))
+            t.setItem(row, 2, dcell(
+                f"{pct}%",
+                "#a6e3a1" if pct == 100 else ("#fab387" if pct >= 80 else "#f38ba8")
+            ))
+            t.setItem(row, 3, dcell(
+                f"{avg_ms:.0f}",
+                "#89dceb" if fastest_avg and avg_ms == fastest_avg else "#cdd6f4"
+            ))
+            t.setItem(row, 4, dcell(f"{min_ms:.0f}", "#a6e3a1"))
+            t.setItem(row, 5, dcell(f"{max_ms:.0f}", "#f38ba8"))
+            t.setItem(row, 6, dcell(f"{avg_km:.2f}"))
+
+        # Horizontal bar chart: Avg · Min · Max response time per engine
+        chart_rows = []
+        for name in eng_order:
+            s = self._bench_stats[name]
+            if not s["ok"]:
+                continue
+            eng_obj = next((e for e in ENGINE_LIST if e.NAME == name), None)
+            color   = eng_obj.COLOR if eng_obj else "#cdd6f4"
+            chart_rows.append((
+                name,
+                {
+                    "Avg": s["total_ms"] / s["ok"],
+                    "Min": s["min_ms"],
+                    "Max": s["max_ms"],
+                },
+                color,
+            ))
+        self._bar_chart.set_data(
+            chart_rows,
+            metrics=["Avg", "Min", "Max"],
+            unit="ms",
+        )
+
+    def _refresh_fail_table(self):
+        ft = self._fail_table
+        ft.setRowCount(0)
+        n = len(self._failed_trips)
+        self._fail_count_lbl.setText(
+            f"{'❌' if n else '✓'} Failed Trips: {n}"
+        )
+        self._fail_count_lbl.setStyleSheet(
+            f"color:{'#f38ba8' if n else '#a6e3a1'}; font-weight:700; font-size:11px;"
+        )
+
+        for i, entry in enumerate(reversed(self._failed_trips)):
+            row = ft.rowCount()
+            ft.insertRow(row)
+            ft.setRowHeight(row, 26)
+
+            def fc(text, color=None):
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if color:
+                    item.setForeground(QColor(color))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                return item
+
+            eng_obj = next((e for e in ENGINE_LIST if e.NAME == entry["engine"]), None)
+            eng_color = eng_obj.COLOR if eng_obj else "#cdd6f4"
+
+            start = entry.get("start") or (0, 0)
+            end   = entry.get("end")   or (0, 0)
+            coords_str = (
+                f"{start[0]:.5f},{start[1]:.5f} → {end[0]:.5f},{end[1]:.5f}"
+            )
+            mode_icons = {"car": "🚗", "motorcycle": "🏍", "bike": "🚲", "walk": "🚶"}
+
+            ft.setItem(row, 0, fc(str(n - i), "#6c7086"))
+            ft.setItem(row, 1, fc(entry["ts"], "#a6adc8"))
+            ft.setItem(row, 2, fc(entry["engine"], eng_color))
+            ft.setItem(row, 3, fc(
+                f"{mode_icons.get(entry['mode'], '')} {entry['mode']}"
+            ))
+            err = entry["error"]
+            ft.setItem(row, 4, fc(err[:80] if len(err) > 80 else err, "#f38ba8"))
+            ft.setItem(row, 5, fc(coords_str, "#a6adc8"))
+
+    def _replay_failed_trip(self):
+        row = self._fail_table.currentRow()
+        if row < 0:
+            self._status.showMessage("Select a failed trip row first")
+            return
+        self._replay_failed_trip_row(row)
+
+    def _replay_failed_trip_row(self, row: int):
+        # Table shows newest first (reversed), map back to _failed_trips index
+        n   = len(self._failed_trips)
+        idx = n - 1 - row
+        if idx < 0 or idx >= n:
+            return
+        entry = self._failed_trips[idx]
+        start = entry.get("start")
+        end   = entry.get("end")
+        if not start or not end:
+            self._status.showMessage("No coordinates stored for this failure")
+            return
+        self._tabs.setCurrentIndex(0)   # switch to Map tab
+        self._do_clear()
+        self.on_start_set(start[0], start[1])
+        self.on_end_set(end[0], end[1])
+        self._status.showMessage(
+            f"Replaying failed trip #{n - row} — {entry['engine']} ({entry['error'][:60]})"
+        )
+        self._do_route()
+
+    def _clear_failed_trips(self):
+        self._failed_trips.clear()
+        self._refresh_fail_table()
+        self._status.showMessage("Failed trips cleared")
+
+    def _clear_bench_stats(self):
+        for s in self._bench_stats.values():
+            s["trips"]    = 0
+            s["ok"]       = 0
+            s["total_ms"] = 0.0
+            s["min_ms"]   = float("inf")
+            s["max_ms"]   = 0.0
+            s["total_km"] = 0.0
+        self._failed_trips.clear()
+        self._update_dashboard()
+        self._status.showMessage("Benchmark stats cleared")
+
     # ── Routing ────────────────────────────────────────────────────────
     def _do_route(self):
         if not self._start or not self._end:
@@ -760,6 +1450,7 @@ class MainWindow(QMainWindow):
 
     def _on_result(self, result):
         self._current_run_results.append(result)
+        self._record_bench_result(result)
 
         if result.ok:
             coords_json = json.dumps(result.coordinates)
@@ -809,6 +1500,7 @@ class MainWindow(QMainWindow):
         self._table.setCellWidget(row, 4, swatch)
 
     def _on_all_done(self):
+        self._update_dashboard()
         self._btn_route.setEnabled(True)
         active = [r for r in self._restrictions if self._is_restriction_active(r)]
         n_r = len(active)
@@ -845,6 +1537,10 @@ class MainWindow(QMainWindow):
                 end     = self._end,
                 results = list(self._current_run_results),
             )
+
+        # Continue batch if running
+        if self._batch_remaining > 0:
+            QTimer.singleShot(50, self._run_next_batch_trip)
 
     def _do_clear(self):
         self._js("clearAll()")   # also calls clearViaPoints() in JS

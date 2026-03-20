@@ -15,6 +15,11 @@ _MODE = {
     "walk":       "pedestrian",
 }
 
+# Ferry routes run on fixed schedules — not affected by road traffic.
+# OSM duration tags are often inaccurate; force 10 km/h for all ferries.
+_FERRY_SPEED_KPH   = 10.0
+_FERRY_ENTER_TYPE  = 28   # Valhalla maneuver enum: kFerryEnter
+
 _COSTING_OPTIONS = {
     "auto": {
         "use_highways":       1.0,
@@ -125,8 +130,9 @@ class ValhallaEngine(BaseEngine):
     def _raw_route(self, start_lat, start_lon, end_lat, end_lon,
                    costing: str, active: list[dict],
                    buffer_deg: float,
-                   via_points: list[tuple[float, float]] | None = None) -> tuple[list, dict] | None:
-        """One Valhalla /route call. Returns (coords, summary) or None on error."""
+                   via_points: list[tuple[float, float]] | None = None
+                   ) -> tuple[list, dict, list]:
+        """One Valhalla /route call. Returns (coords, summary, maneuvers)."""
         locs = [{"lat": start_lat, "lon": start_lon, "type": "break"}]
         for vp in (via_points or []):
             locs.append({"lat": vp[0], "lon": vp[1], "type": "through"})
@@ -139,16 +145,18 @@ class ValhallaEngine(BaseEngine):
             "costing_options": {costing: _COSTING_OPTIONS.get(costing, {})},
         }
         if active:
-            locs  = _restrictions_to_exclude_locations(active)
+            xlocs = _restrictions_to_exclude_locations(active)
             polys = _restrictions_to_exclude_polygons(active, buffer_deg)
-            if locs:  body["exclude_locations"] = locs
+            if xlocs: body["exclude_locations"] = xlocs
             if polys: body["exclude_polygons"]  = polys
         r = httpx.post(f"{self.url}/route", json=body, timeout=15.0)
         r.raise_for_status()
-        data    = r.json()
-        trip    = data["trip"]
-        coords  = _decode_polyline6(trip["legs"][0]["shape"])
-        return coords, trip["summary"]
+        data      = r.json()
+        trip      = data["trip"]
+        coords    = _decode_polyline6(trip["legs"][0]["shape"])
+        maneuvers = [m for leg in trip.get("legs", [])
+                       for m in leg.get("maneuvers", [])]
+        return coords, trip["summary"], maneuvers
 
     def route(self, start_lat, start_lon, end_lat, end_lon, mode="car",
               restrictions: list[dict] | None = None,
@@ -172,7 +180,7 @@ class ValhallaEngine(BaseEngine):
             if one_way:
                 # ── Pass 1: route ignoring 1-way restrictions ──────────
                 # so we can detect which ones the natural route violates.
-                p1_coords, _ = self._raw_route(
+                p1_coords, _, _ = self._raw_route(
                     start_lat, start_lon, end_lat, end_lon,
                     costing, two_way, buffer_deg, via_points)
 
@@ -187,7 +195,7 @@ class ValhallaEngine(BaseEngine):
             else:
                 active = two_way
 
-            coords, summary = self._raw_route(
+            coords, summary, maneuvers = self._raw_route(
                 start_lat, start_lon, end_lat, end_lon,
                 costing, active, buffer_deg, via_points)
 
@@ -204,11 +212,34 @@ class ValhallaEngine(BaseEngine):
                     print(f"[Valhalla] ⚠ Route still uses restricted way(s): {leaked}"
                           f" — try increasing the buffer size.")
 
+            # ── Ferry speed correction ─────────────────────────────────
+            # Valhalla computes ferry time from OSM duration tags which are
+            # often too slow / inaccurate. Force _FERRY_SPEED_KPH instead.
+            # Traffic multiplier is NOT applied to ferries (fixed schedule).
+            ferry_raw_s  = 0.0
+            ferry_dist_km = 0.0
+            for m in maneuvers:
+                mtype = m.get("type", 0)
+                instr = (m.get("instruction", "") or "").lower()
+                if mtype == _FERRY_ENTER_TYPE or "ferry" in instr:
+                    ferry_dist_km += m.get("length", 0.0)
+                    ferry_raw_s   += m.get("time",   0.0)
+
+            if ferry_dist_km > 0:
+                ferry_corrected_s = ferry_dist_km / _FERRY_SPEED_KPH * 3600
+                non_ferry_raw_s   = summary["time"] - ferry_raw_s
+                duration_s        = non_ferry_raw_s * factor + ferry_corrected_s
+                print(f"[Valhalla] ⛴ Ferry: {ferry_dist_km:.2f} km "
+                      f"@ {_FERRY_SPEED_KPH} km/h → {ferry_corrected_s/60:.1f} min "
+                      f"(OSM had {ferry_raw_s/60:.1f} min)")
+            else:
+                duration_s = summary["time"] * factor
+
             return RouteResult(
                 engine      = self.NAME,
                 color       = self.COLOR,
                 distance_km = summary["length"],
-                duration_s  = summary["time"] * factor,
+                duration_s  = duration_s,
                 coordinates = coords,
                 osm_way_ids = osm_way_ids,
             )
